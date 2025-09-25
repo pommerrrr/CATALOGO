@@ -1,8 +1,10 @@
 // api/ml/preco.js
 // === WID-ONLY ===
-// Entrada: ?wid=MLBxxxxxxxxxx  (aceita também ?product_id=MLB..., mas o recomendado é ?wid=)
-// Saída: sempre JSON. Busca preço do ANÚNCIO via /items (não usa catálogo).
-// Tenta público primeiro; se 401/403/5xx, tenta com OAuth (se existir token.js).
+// Entrada: ?wid=MLBxxxxxxxxxx  (compat: ?product_id=MLB...)
+// Busca preço do ANÚNCIO via /items. Comportamento:
+// 1) Se houver token OAuth válido (token.js): tenta COM TOKEN primeiro (direto e bulk).
+// 2) Se falhar ou não houver token: tenta PÚBLICO (UA de navegador, diret/bulk).
+// Sempre retorna JSON.
 
 const ML_BASE = "https://api.mercadolibre.com";
 
@@ -15,18 +17,21 @@ function sendJSON(res, code, body) {
   res.end(JSON.stringify(body));
 }
 
-// tenta carregar token.js dinamicamente (se não existir, segue sem token)
+// tenta carregar token.js (named ou default export). Se não houver/der erro, retorna null.
 async function getTokenMaybe() {
   try {
     const mod = await import("./token.js");
-    if (mod && typeof mod.getAccessToken === "function") {
-      try {
-        return await mod.getAccessToken();
-      } catch {
-        return null;
-      }
+    const fn =
+      (mod && typeof mod.getAccessToken === "function" && mod.getAccessToken) ||
+      (mod && typeof mod.default === "function" && mod.default) ||
+      null;
+    if (!fn) return null;
+    try {
+      const t = await fn();
+      return (typeof t === "string" && t.trim()) ? t.trim() : null;
+    } catch {
+      return null;
     }
-    return null;
   } catch {
     return null;
   }
@@ -43,6 +48,7 @@ const PUBLIC_HEADERS = {
   Origin: "https://www.mercadolivre.com.br",
   Referer: "https://www.mercadolivre.com.br/"
 };
+
 const authHeaders = (token) => ({
   Accept: "application/json",
   "User-Agent": "WidOnly/1.0 (server)",
@@ -72,24 +78,25 @@ function normalizeBulk(r) {
 
 // ---------- Core: obter preço por WID ----------
 async function getPriceByWID(wid, token) {
-  // Cadeia de tentativas (ordem pensada para maximizar sucesso):
-  // Público (bulk com attrs) → Público (direto com attrs) → Público (direto simples) → Público (bulk simples)
-  // Se falhar: com token (mesma ordem)
-  const tries = [
-    { kind: "public_bulk_attrs", url: `${ML_BASE}/items?ids=${wid}&attributes=price,status,available_quantity,sold_quantity,permalink`, headers: PUBLIC_HEADERS, bulk: true },
-    { kind: "public_direct_attrs", url: `${ML_BASE}/items/${wid}?attributes=price,status,available_quantity,sold_quantity,permalink`, headers: PUBLIC_HEADERS },
-    { kind: "public_direct", url: `${ML_BASE}/items/${wid}`, headers: PUBLIC_HEADERS },
-    { kind: "public_bulk", url: `${ML_BASE}/items?ids=${wid}`, headers: PUBLIC_HEADERS, bulk: true },
-  ];
+  // Se houver token, priorize tentativas COM TOKEN.
+  const tries = [];
 
   if (token) {
     tries.push(
-      { kind: "auth_bulk_attrs", url: `${ML_BASE}/items?ids=${wid}&attributes=price,status,available_quantity,sold_quantity,permalink`, headers: authHeaders(token), bulk: true },
       { kind: "auth_direct_attrs", url: `${ML_BASE}/items/${wid}?attributes=price,status,available_quantity,sold_quantity,permalink`, headers: authHeaders(token) },
-      { kind: "auth_direct", url: `${ML_BASE}/items/${wid}`, headers: authHeaders(token) },
-      { kind: "auth_bulk", url: `${ML_BASE}/items?ids=${wid}`, headers: authHeaders(token), bulk: true },
+      { kind: "auth_bulk_attrs",  url: `${ML_BASE}/items?ids=${wid}&attributes=price,status,available_quantity,sold_quantity,permalink`, headers: authHeaders(token), bulk: true },
+      { kind: "auth_direct",      url: `${ML_BASE}/items/${wid}`, headers: authHeaders(token) },
+      { kind: "auth_bulk",        url: `${ML_BASE}/items?ids=${wid}`, headers: authHeaders(token), bulk: true },
     );
   }
+
+  // Depois, tentativas públicas (sem token)
+  tries.push(
+    { kind: "public_direct_attrs", url: `${ML_BASE}/items/${wid}?attributes=price,status,available_quantity,sold_quantity,permalink`, headers: PUBLIC_HEADERS },
+    { kind: "public_bulk_attrs",  url: `${ML_BASE}/items?ids=${wid}&attributes=price,status,available_quantity,sold_quantity,permalink`, headers: PUBLIC_HEADERS, bulk: true },
+    { kind: "public_direct",      url: `${ML_BASE}/items/${wid}`, headers: PUBLIC_HEADERS },
+    { kind: "public_bulk",        url: `${ML_BASE}/items?ids=${wid}`, headers: PUBLIC_HEADERS, bulk: true },
+  );
 
   for (const t of tries) {
     const r = await fetchJson(t.url, t.headers);
@@ -99,7 +106,6 @@ async function getPriceByWID(wid, token) {
       continue;
     }
 
-    // bulk → normaliza
     if (t.bulk) {
       const nb = normalizeBulk(r);
       if (!nb.ok) continue;
@@ -114,11 +120,9 @@ async function getPriceByWID(wid, token) {
           via: t.kind
         };
       }
-      // sem preço → tenta próxima
       continue;
     }
 
-    // direta
     const body = r.data || {};
     const price = Number(body.price || 0);
     if (price > 0) {
@@ -132,7 +136,6 @@ async function getPriceByWID(wid, token) {
     }
   }
 
-  // se chegou aqui, todas tentativas falharam
   return {
     ok: false,
     status: 401,
@@ -155,7 +158,7 @@ export default async function handler(req, res) {
     if (req.method === "OPTIONS") return sendJSON(res, 200, { ok: true });
     if (req.method !== "GET")     return sendJSON(res, 200, { ok:false, error_code:"METHOD_NOT_ALLOWED", http_status:405 });
 
-    // Somente WID — aceitar ?wid=... (recomendado) ou ?product_id=... por compatibilidade
+    // Somente WID — preferir ?wid=. (compat: ?product_id=)
     const q   = req.query || {};
     const wid = String(q.wid || q.product_id || "").trim().toUpperCase();
 
@@ -168,8 +171,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // tenta com público; se falhar, tenta com token (se houver)
-    const token = await getTokenMaybe();
+    const token = await getTokenMaybe();  // pode ser null (segue só público)
     const out   = await getPriceByWID(wid, token);
 
     if (!out.ok) {
