@@ -1,56 +1,57 @@
 // api/ml/preco.js
-// ✅ WID (MLB com 10+ dígitos) via chamadas PÚBLICAS, sem Authorization, com fallbacks:
-//    1) /items/{WID}
-//    2) /items/{WID}?attributes=...
-//    3) /items?ids={WID}
-//    4) /items?ids={WID}&attributes=...
-// ✅ Catálogo (MLB com <10 dígitos) via /products/{id} com OAuth (token.js) → buy_box_winner
-// ✅ product_id pode ser MLB direto OU link de catálogo com #...wid=MLB... (extrai WID)
-// ✅ Sempre responde JSON
+// === WID-ONLY ===
+// Entrada: ?wid=MLBxxxxxxxxxx  (aceita também ?product_id=MLB..., mas o recomendado é ?wid=)
+// Saída: sempre JSON. Busca preço do ANÚNCIO via /items (não usa catálogo).
+// Tenta público primeiro; se 401/403/5xx, tenta com OAuth (se existir token.js).
 
 const ML_BASE = "https://api.mercadolibre.com";
 
-// --------- Utils ---------
-function isAnyMLB(id) {
-  return !!id && /^MLB\d+$/i.test(String(id).trim());
-}
-function isWID(id) {
-  return !!id && /^MLB\d{10,}$/i.test(String(id).trim());
-}
-function extractWidFromHash(url) {
-  if (!url) return null;
-  try {
-    const hash = String(url).split("#")[1] || "";
-    const m = hash.match(/wid=(MLB\d{10,})/i);
-    return m ? m[1].toUpperCase() : null;
-  } catch { return null; }
-}
-function extractItemIdFromPermalink(url) {
-  if (!url) return null;
-  try {
-    const m = String(url).match(/MLB\d{10,}/i);
-    return m ? m[0].toUpperCase() : null;
-  } catch { return null; }
-}
-function json(res, code, body) {
+// ---------- Utils ----------
+const isWID = (s) => !!s && /^MLB\d{10,}$/i.test(String(s).trim());
+
+function sendJSON(res, code, body) {
   res.statusCode = code;
   res.setHeader("Content-Type", "application/json");
   res.end(JSON.stringify(body));
 }
 
-// --------- HTTP helpers ---------
-const BROWSER_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/125.0 Safari/537.36";
-
-async function fetchPublicJson(url) {
-  const r = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": BROWSER_UA,
-      "Cache-Control": "no-cache"
+// tenta carregar token.js dinamicamente (se não existir, segue sem token)
+async function getTokenMaybe() {
+  try {
+    const mod = await import("./token.js");
+    if (mod && typeof mod.getAccessToken === "function") {
+      try {
+        return await mod.getAccessToken();
+      } catch {
+        return null;
+      }
     }
-  });
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------- HTTP helpers ----------
+const PUBLIC_HEADERS = {
+  Accept: "application/json",
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+  "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+  "Cache-Control": "no-cache",
+  Origin: "https://www.mercadolivre.com.br",
+  Referer: "https://www.mercadolivre.com.br/"
+};
+const authHeaders = (token) => ({
+  Accept: "application/json",
+  "User-Agent": "WidOnly/1.0 (server)",
+  "Cache-Control": "no-cache",
+  Authorization: `Bearer ${token}`
+});
+
+async function fetchJson(url, headers) {
+  const r = await fetch(url, { headers });
   const ct = r.headers.get("content-type") || "";
   let data = null;
   if (ct.includes("application/json")) {
@@ -59,128 +60,89 @@ async function fetchPublicJson(url) {
   return { ok: r.ok, status: r.status, data, url, ct };
 }
 
-function buildAuthHeaders(token) {
-  const h = {
-    Accept: "application/json",
-    "User-Agent": "ImportCostControl/1.0 (server)",
-    "Cache-Control": "no-cache"
-  };
-  if (token) h.Authorization = `Bearer ${token}`;
-  return h;
-}
-
-async function fetchAuthJson(url, token) {
-  const r = await fetch(url, { headers: buildAuthHeaders(token) });
-  const ct = r.headers.get("content-type") || "";
-  let data = null;
-  if (ct.includes("application/json")) {
-    try { data = await r.json(); } catch {}
+// Normaliza respostas do /items?ids=...
+function normalizeBulk(r) {
+  const arr = Array.isArray(r.data) ? r.data : [];
+  const first = arr[0] || {};
+  if (first.code === 200 && first.body) {
+    return { ok: true, data: first.body, status: 200, url: r.url };
   }
-  return { ok: r.ok, status: r.status, data, url, ct };
+  return { ok: false, status: r.status || 404, url: r.url };
 }
 
-// --------- WID (Item) — 100% público ---------
-async function getItemPricePublic(wid) {
-  // Tenta em ordem: direta sem atributos → direta com atributos → bulk sem attrs → bulk com attrs
+// ---------- Core: obter preço por WID ----------
+async function getPriceByWID(wid, token) {
+  // Cadeia de tentativas (ordem pensada para maximizar sucesso):
+  // Público (bulk com attrs) → Público (direto com attrs) → Público (direto simples) → Público (bulk simples)
+  // Se falhar: com token (mesma ordem)
   const tries = [
-    `${ML_BASE}/items/${wid}`,
-    `${ML_BASE}/items/${wid}?attributes=price,status,available_quantity,sold_quantity,permalink`,
-    `${ML_BASE}/items?ids=${wid}`,
-    `${ML_BASE}/items?ids=${wid}&attributes=price,status,available_quantity,sold_quantity,permalink`
+    { kind: "public_bulk_attrs", url: `${ML_BASE}/items?ids=${wid}&attributes=price,status,available_quantity,sold_quantity,permalink`, headers: PUBLIC_HEADERS, bulk: true },
+    { kind: "public_direct_attrs", url: `${ML_BASE}/items/${wid}?attributes=price,status,available_quantity,sold_quantity,permalink`, headers: PUBLIC_HEADERS },
+    { kind: "public_direct", url: `${ML_BASE}/items/${wid}`, headers: PUBLIC_HEADERS },
+    { kind: "public_bulk", url: `${ML_BASE}/items?ids=${wid}`, headers: PUBLIC_HEADERS, bulk: true },
   ];
 
-  for (const url of tries) {
-    const r = await fetchPublicJson(url);
+  if (token) {
+    tries.push(
+      { kind: "auth_bulk_attrs", url: `${ML_BASE}/items?ids=${wid}&attributes=price,status,available_quantity,sold_quantity,permalink`, headers: authHeaders(token), bulk: true },
+      { kind: "auth_direct_attrs", url: `${ML_BASE}/items/${wid}?attributes=price,status,available_quantity,sold_quantity,permalink`, headers: authHeaders(token) },
+      { kind: "auth_direct", url: `${ML_BASE}/items/${wid}`, headers: authHeaders(token) },
+      { kind: "auth_bulk", url: `${ML_BASE}/items?ids=${wid}`, headers: authHeaders(token), bulk: true },
+    );
+  }
 
-    // Caso bulk, normalizar resposta (array [{code, body}])
-    if (url.includes("/items?ids=") && r.ok) {
-      const arr = Array.isArray(r.data) ? r.data : [];
-      const first = arr[0] || {};
-      if (first.code === 200 && first.body) {
-        const price = Number(first.body.price || 0);
-        if (price > 0) {
-          return {
-            ok: true,
-            price,
-            source: "item",
-            item_id: wid,
-            sold_winner: Number.isFinite(first.body.sold_quantity) ? first.body.sold_quantity : null,
-            via: url
-          };
-        }
-        return { ok: false, status: 404, error_code: "NO_PRICE", message: "Anúncio sem preço disponível", url };
-      }
-      // se code !== 200, tenta próximo fallback
+  for (const t of tries) {
+    const r = await fetchJson(t.url, t.headers);
+
+    if (!r.ok) {
+      // segue para próxima tentativa
       continue;
     }
 
-    // Direta
-    if (r.ok) {
-      const price = Number(r.data?.price || 0);
+    // bulk → normaliza
+    if (t.bulk) {
+      const nb = normalizeBulk(r);
+      if (!nb.ok) continue;
+      const body = nb.data || {};
+      const price = Number(body.price || 0);
       if (price > 0) {
         return {
           ok: true,
           price,
-          source: "item",
           item_id: wid,
-          sold_winner: Number.isFinite(r.data?.sold_quantity) ? r.data.sold_quantity : null,
-          via: url
+          sold_winner: Number.isFinite(body.sold_quantity) ? body.sold_quantity : null,
+          via: t.kind
         };
       }
-      // Sem preço → tenta próximo fallback
+      // sem preço → tenta próxima
       continue;
     }
 
-    // Se deu 401/403/5xx, tenta próximo fallback
-    // (não retornamos ainda; só devolvemos se acabar as tentativas)
+    // direta
+    const body = r.data || {};
+    const price = Number(body.price || 0);
+    if (price > 0) {
+      return {
+        ok: true,
+        price,
+        item_id: wid,
+        sold_winner: Number.isFinite(body.sold_quantity) ? body.sold_quantity : null,
+        via: t.kind
+      };
+    }
   }
 
-  // Se chegou aqui, todos os fallbacks falharam
+  // se chegou aqui, todas tentativas falharam
   return {
     ok: false,
     status: 401,
     error_code: "UPSTREAM_ERROR",
-    message: "Falha ao obter preço público do WID (todas as tentativas).",
+    message: "Falha ao obter preço do WID (todas as tentativas).",
     url: "all-fallbacks"
   };
 }
 
-// --------- Catálogo (buy box) — com OAuth ---------
-import { getAccessToken } from "./token.js";
-
-async function getCatalogBuyBox(productId) {
-  const token = await getAccessToken().catch(() => null);
-  if (!token) {
-    return { ok:false, status:401, error_code:"AUTH_REQUIRED", message:"Token ausente/expirado para /products/{id}" };
-  }
-  const url = `${ML_BASE}/products/${productId}`;
-  const r = await fetchAuthJson(url, token);
-  if (!r.ok) {
-    const code = r.status === 403 ? "FORBIDDEN" : (r.status === 404 ? "CATALOG_NOT_FOUND" : "UPSTREAM_ERROR");
-    const msg  = r.status === 403 ? "Permissões insuficientes para /products/{id}" :
-                 r.status === 404 ? "Catálogo não encontrado" :
-                 `Erro ${r.status} em /products/{id}`;
-    return { ok:false, status:r.status, error_code:code, message:msg, url };
-  }
-  if (!r.ct.includes("application/json")) {
-    return { ok:false, status:502, error_code:"UPSTREAM_JSON", message:"Resposta inválida (não JSON) em /products/{id}", url };
-  }
-  const winner = r.data?.buy_box_winner;
-  if (!(winner?.price > 0)) {
-    return { ok:false, status:404, error_code:"NO_BUY_BOX", message:"Catálogo sem buy box disponível via API no momento.", url };
-  }
-
-  // tentar soldados do item vencedor (best-effort)
-  let sold = null;
-  if (winner.item_id) {
-    const ir = await fetchAuthJson(`${ML_BASE}/items/${winner.item_id}`, token);
-    if (ir.ok && Number.isFinite(ir.data?.sold_quantity)) sold = ir.data.sold_quantity;
-  }
-
-  return { ok:true, price:winner.price, item_id:winner.item_id || null, sold };
-}
-
-// --------- Handler ---------
+// ---------- Handler ----------
 export default async function handler(req, res) {
   try {
     // CORS/JSON
@@ -190,130 +152,47 @@ export default async function handler(req, res) {
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
     res.setHeader("Cache-Control", "no-store");
 
-    if (req.method === "OPTIONS") return json(res, 200, { ok: true });
-    if (req.method !== "GET")     return json(res, 200, { ok:false, error_code:"METHOD_NOT_ALLOWED", http_status:405 });
+    if (req.method === "OPTIONS") return sendJSON(res, 200, { ok: true });
+    if (req.method !== "GET")     return sendJSON(res, 200, { ok:false, error_code:"METHOD_NOT_ALLOWED", http_status:405 });
 
-    const q = req.query || {};
-    let productId   = String((q.product_id ?? "")).trim();
-    let myItemId    = String((q.my_item_id ?? "")).trim();
-    const permalink = String((q.my_permalink ?? "")).trim();
+    // Somente WID — aceitar ?wid=... (recomendado) ou ?product_id=... por compatibilidade
+    const q   = req.query || {};
+    const wid = String(q.wid || q.product_id || "").trim().toUpperCase();
 
-    // Se vier link de catálogo com #...wid=MLB..., extrair WID e tratar como item
-    if (!isWID(productId)) {
-      const wid = extractWidFromHash(productId);
-      if (isWID(wid)) productId = wid;
-    }
-
-    // Se não for MLB válido mas vier permalink, tenta extrair WID
-    if (!isAnyMLB(productId) && permalink) {
-      const fromP = extractItemIdFromPermalink(permalink);
-      if (isWID(fromP)) myItemId = fromP;
-    }
-
-    // Decisão: catálogo (<10 dígitos) ou WID (>=10)
-    if (isAnyMLB(productId)) {
-      const digits = productId.replace(/MLB/i, "");
-      const isCatalog = digits.length < 10;
-
-      if (isCatalog) {
-        // Catálogo → buy box com OAuth
-        const r = await getCatalogBuyBox(productId);
-        if (r.ok) {
-          return json(res, 200, {
-            ok: true,
-            price: r.price,
-            source: "buy_box",
-            product_id: productId,
-            item_id: r.item_id,
-            sold_winner: r.sold,
-            sold_catalog_total: null,
-            fetched_at: new Date().toISOString()
-          });
-        }
-
-        // Fallback: se usuario mandar my_item_id, tenta como item público
-        if (isWID(myItemId)) {
-          const fr = await getItemPricePublic(myItemId);
-          if (fr.ok) {
-            return json(res, 200, {
-              ok: true,
-              price: fr.price,
-              source: "my_item",
-              product_id: productId,
-              item_id: myItemId,
-              sold_winner: fr.sold_winner,
-              sold_catalog_total: null,
-              fetched_at: new Date().toISOString()
-            });
-          }
-        }
-
-        return json(res, 200, {
-          ok:false,
-          error_code: r.error_code || "UPSTREAM_ERROR",
-          message:  r.message    || "Falha ao consultar catálogo",
-          http_status: r.status  || 502,
-          details: { upstream_url: r.url || `${ML_BASE}/products/${productId}` }
-        });
-      }
-
-      // WID (Item) → público, sem Authorization, com fallbacks
-      const r = await getItemPricePublic(productId);
-      if (!r.ok) {
-        return json(res, 200, {
-          ok:false,
-          error_code: r.error_code || "UPSTREAM_ERROR",
-          message:  r.message    || `Erro ${r.status} consultando WID`,
-          http_status: r.status  || 500,
-          details: { upstream_url: r.url }
-        });
-      }
-      return json(res, 200, {
-        ok: true,
-        price: r.price,
-        source: "item",
-        product_id: productId,
-        item_id: productId,
-        sold_winner: r.sold_winner,
-        sold_catalog_total: null,
-        fetched_at: new Date().toISOString()
-      });
-    }
-
-    // Sem product_id MLB válido → tenta fallback para my_item_id/permalink se vier
-    if (isWID(myItemId)) {
-      const r = await getItemPricePublic(myItemId);
-      if (r.ok) {
-        return json(res, 200, {
-          ok: true,
-          price: r.price,
-          source: "item",
-          product_id: myItemId,
-          item_id: myItemId,
-          sold_winner: r.sold_winner,
-          sold_catalog_total: null,
-          fetched_at: new Date().toISOString()
-        });
-      }
-      return json(res, 200, {
+    if (!isWID(wid)) {
+      return sendJSON(res, 200, {
         ok:false,
-        error_code: r.error_code || "UPSTREAM_ERROR",
-        message:  r.message    || `Erro ${r.status} consultando WID`,
-        http_status: r.status  || 500,
-        details: { upstream_url: r.url }
+        error_code: "MISSING_WID",
+        message: "Envie wid=MLBxxxxxxxxxx (somente WID, 10+ dígitos).",
+        http_status: 400
       });
     }
 
-    return json(res, 200, {
-      ok:false,
-      error_code: "MISSING_PARAM",
-      message: "Envie product_id=MLB... (catálogo ou WID). Links com #...wid=MLB... também são aceitos.",
-      http_status: 400
+    // tenta com público; se falhar, tenta com token (se houver)
+    const token = await getTokenMaybe();
+    const out   = await getPriceByWID(wid, token);
+
+    if (!out.ok) {
+      return sendJSON(res, 200, {
+        ok:false,
+        error_code: out.error_code || "UPSTREAM_ERROR",
+        message: out.message || "Falha ao consultar WID",
+        http_status: out.status || 500,
+        details: { upstream_url: out.url }
+      });
+    }
+
+    return sendJSON(res, 200, {
+      ok: true,
+      price: out.price,
+      source: "item",
+      product_id: wid,
+      item_id: out.item_id,
+      sold_winner: out.sold_winner,
+      fetched_at: new Date().toISOString()
     });
 
   } catch (e) {
-    return json(res, 200, {
-      ok:false, error_code:"INTERNAL", message:String(e?.message || e), http_status:500
-    });
+    return sendJSON(res, 200, { ok:false, error_code:"INTERNAL", message:String(e?.message || e), http_status:500 });
   }
 }
