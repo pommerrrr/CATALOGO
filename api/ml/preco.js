@@ -1,17 +1,31 @@
 // api/ml/preco.js
-// Objetivo: preço que o catálogo está ganhando (buy box). Fallback: seu anúncio.
-// Fluxo:
-// - Catálogo (MLB + <10 dígitos): tenta /products/{id} → buy_box_winner.
-//   * Se não vier, usa seu anúncio se você passar my_item_id=MLB... OU my_permalink=https://.../MLB....
-// - Item (MLB + >=10 dígitos): retorna /items/{id}.
-// Sempre responde JSON.
+// Retorna o preço do catálogo (buy box) quando for ID de catálogo (MLB + <10 dígitos)
+// ou o preço do anúncio (WID, MLB + >=10 dígitos).
+// Corrigido para WID: NUNCA usar Authorization em /items (evita 403 quando o item não é seu).
+// Para /products/{id} (buy box) usa OAuth via token.js.
+//
+// Aceita:
+//   - ?product_id=MLB...  (pode ser catálogo ou WID)
+//   - ?product_id=<link de catálogo com #...wid=MLB...>  (extrai WID e trata como item)
+//   - ?my_item_id=MLB... ou ?my_permalink=https://.../MLB...  (fallback quando catálogo sem buy box)
+//
+// Resposta sempre em JSON.
 
-function buildHeaders(token) {
-  const h = { Accept: 'application/json', 'User-Agent': 'ImportCostControl/1.0 (server)' };
-  if (token) h.Authorization = `Bearer ${token}`;
-  return h;
+function isAnyMLB(id) {
+  return !!id && /^MLB\d+$/i.test(String(id).trim());
 }
-
+// WID = MLB + 10 ou mais dígitos
+function isWID(id) {
+  return !!id && /^MLB\d{10,}$/i.test(String(id).trim());
+}
+function extractWidFromHash(url) {
+  if (!url) return null;
+  try {
+    const hash = String(url).split("#")[1] || "";
+    const m = hash.match(/wid=(MLB\d{10,})/i);
+    return m ? m[1].toUpperCase() : null;
+  } catch { return null; }
+}
 function extractItemIdFromPermalink(url) {
   if (!url) return null;
   try {
@@ -20,207 +34,247 @@ function extractItemIdFromPermalink(url) {
   } catch { return null; }
 }
 
-export default async function handler(req, res) {
-  try {
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+const ML_BASE = "https://api.mercadolibre.com";
 
-    if (req.method === 'OPTIONS') {
-      return res.status(200).end(JSON.stringify({ ok: true }));
-    }
-    if (req.method !== 'GET') {
-      return res.status(200).end(JSON.stringify({
-        ok: false, error_code: 'METHOD_NOT_ALLOWED', message: 'Only GET', http_status: 405
-      }));
-    }
-
-    const mlId = String((req.query?.product_id ?? '')).trim();
-    let myItemId = String((req.query?.my_item_id ?? '')).trim();
-    const myPermalink = String((req.query?.my_permalink ?? '')).trim();
-    const debug = String(req.query?.debug ?? '') === '1';
-
-    if (!mlId) {
-      return res.status(200).end(JSON.stringify({
-        ok:false, error_code:'MISSING_PARAM', message:'product_id is required', http_status:400
-      }));
-    }
-    if (!/^MLB\d+$/.test(mlId)) {
-      return res.status(200).end(JSON.stringify({
-        ok:false, error_code:'INVALID_ID_FORMAT', message:'Use MLB + números', http_status:400
-      }));
-    }
-
-    // Se não veio my_item_id, mas veio my_permalink, extraímos o ID da URL
-    if (!/^MLB\d{10,}$/.test(myItemId) && myPermalink) {
-      const parsed = extractItemIdFromPermalink(myPermalink);
-      if (parsed) myItemId = parsed;
-    }
-    const myItemIdValid = /^MLB\d{10,}$/.test(myItemId);
-
-    // Token via arquivo JS (.js é obrigatório em ESM/Vercel)
-    let token = null, tokenErr = null;
-    try {
-      const mod = await import('./token.js');
-      if (typeof mod.getAccessToken === 'function') {
-        token = await mod.getAccessToken();
-      } else {
-        tokenErr = 'getAccessToken não exportado por ./token.js';
-      }
-    } catch (e) {
-      tokenErr = 'Falha ao importar/usar ./token.js: ' + e.message;
-    }
-
-    const result = await getPrice({ mlId, myItemId: myItemIdValid ? myItemId : null, token });
-
-    if (debug) result._debug = { tokenOk: !!token, tokenErr, myItemId, myPermalink, myItemIdValid };
-    return res.status(200).end(JSON.stringify(result));
-  } catch (e) {
-    return res.status(200).end(JSON.stringify({
-      ok:false, error_code:'INTERNAL', message:String(e?.message||e), http_status:500
-    }));
-  }
+function json(res, code, body) {
+  res.statusCode = code;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(body));
 }
 
-async function getPrice({ mlId, myItemId, token }) {
-  const base = 'https://api.mercadolibre.com';
-  const fetched_at = new Date().toISOString();
-  const isCatalog = mlId.replace('MLB','').length < 10;
+function buildHeaders(token) {
+  const h = { Accept: "application/json", "User-Agent": "ImportCostControl/1.0 (server)" };
+  if (token) h.Authorization = `Bearer ${token}`;
+  return h;
+}
 
-  if (isCatalog) {
-    if (!token) {
-      return { ok:false, error_code:'AUTH_REQUIRED', message:'Token ausente para consultar catálogo.', http_status:401 };
-    }
-
-    // 1) tenta o buy box
-    const url = `${base}/products/${mlId}`;
-    try {
-      const r = await fetch(url, { headers: buildHeaders(token) });
-      const ct = r.headers.get('content-type') || '';
-      if (!r.ok) {
-        if (r.status === 401) {
-          return { ok:false, error_code:'AUTH_REQUIRED', message:'401 em /products/{id}. Reautorize o app/escopos.', http_status:401, details:{ upstream_url:url } };
-        }
-        if (r.status === 403) {
-          return { ok:false, error_code:'FORBIDDEN', message:'403 em /products/{id}. Permissões insuficientes.', http_status:403, details:{ upstream_url:url } };
-        }
-        if (r.status === 404) {
-          return { ok:false, error_code:'CATALOG_NOT_FOUND', message:'Catálogo não encontrado', http_status:404, details:{ upstream_url:url } };
-        }
-        return { ok:false, error_code:'UPSTREAM_ERROR', message:`Erro ${r.status} em /products/{id}`, http_status:r.status, details:{ upstream_url:url } };
-      }
-      if (!ct.includes('application/json')) {
-        return { ok:false, error_code:'UPSTREAM_JSON', message:'Resposta inválida (não JSON) em /products/{id}', http_status:502, details:{ upstream_url:url } };
-      }
-
-      const data = await r.json();
-      const winner = data?.buy_box_winner;
-      if (winner?.price > 0) {
-        // Melhor esforço: vendidos do item vencedor
-        let soldWinner = null;
-        if (winner.item_id) {
-          try {
-            const ri = await fetch(`${base}/items/${winner.item_id}`, { headers: buildHeaders(token) });
-            const cti = ri.headers.get('content-type') || '';
-            if (ri.ok && cti.includes('application/json')) {
-              const ji = await ri.json();
-              soldWinner = Number.isFinite(ji.sold_quantity) ? ji.sold_quantity : null;
-            }
-          } catch {}
-        }
-
-        return {
-          ok: true,
-          price: winner.price,
-          source: 'buy_box',
-          product_id: mlId,
-          item_id: winner.item_id || null,
-          sold_winner: soldWinner,
-          sold_catalog_total: null,
-          fetched_at
-        };
-      }
-    } catch (e) {
-      // segue pro fallback
-    }
-
-    // 2) FALLBACK: usar seu item se você informar (ID real ou permalink)
-    if (myItemId) {
-      const itemUrl = `${base}/items/${myItemId}`;
-      try {
-        const r = await fetch(itemUrl, { headers: buildHeaders(token) });
-        const ct = r.headers.get('content-type') || '';
-        if (!r.ok) {
-          const msg = r.status === 404 ? 'Meu item não encontrado' : `Erro ${r.status} consultando meu item`;
-          return {
-            ok:false,
-            error_code:'MY_ITEM_ERROR',
-            message: msg,
-            http_status:r.status,
-            details:{ upstream_url:itemUrl }
-          };
-        }
-        if (!ct.includes('application/json')) {
-          return { ok:false, error_code:'UPSTREAM_JSON', message:'Resposta inválida (não JSON) em /items/{my_item_id}', http_status:502, details:{ upstream_url:itemUrl } };
-        }
-        const data = await r.json();
-        if (!(data?.price > 0)) {
-          return { ok:false, error_code:'MY_ITEM_NO_PRICE', message:'Meu item sem preço disponível', http_status:404, details:{ upstream_url:itemUrl } };
-        }
-        return {
-          ok: true,
-          price: data.price,
-          source: 'my_item',
-          product_id: mlId,
-          item_id: myItemId,
-          sold_winner: Number.isFinite(data.sold_quantity) ? data.sold_quantity : null,
-          sold_catalog_total: null,
-          fetched_at
-        };
-      } catch (e) {
-        return { ok:false, error_code:'MY_ITEM_ERROR', message:'Erro consultando meu item: ' + String(e?.message||e), http_status:500 };
-      }
-    }
-
-    // Sem buy box e sem seu item informado
-    return {
-      ok:false,
-      error_code:'NO_BUY_BOX',
-      message:'Catálogo sem buy box disponível via API no momento.',
-      http_status:404,
-      details:{ upstream_url:url }
-    };
+async function fetchJson(url, { token=null } = {}) {
+  const r = await fetch(url, { headers: buildHeaders(token) });
+  const ct = r.headers.get("content-type") || "";
+  let data = null;
+  if (ct.includes("application/json")) {
+    try { data = await r.json(); } catch {}
   }
+  return { ok: r.ok, status: r.status, data, url, ct };
+}
 
-  // ID de item direto
-  const itemUrl = `${base}/items/${mlId}`;
+// --------- WID (Item) — chamadas públicas, sem token ---------
+async function fetchItemPublic(wid) {
+  // rota direta
+  const url = `${ML_BASE}/items/${wid}?attributes=price,status,available_quantity,sold_quantity,permalink`;
+  const r = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "WidOnly/1.0" } });
+  const ct = r.headers.get("content-type") || "";
+  let data = null;
+  if (ct.includes("application/json")) {
+    try { data = await r.json(); } catch {}
+  }
+  return { ok: r.ok, status: r.status, data, url };
+}
+
+async function fetchItemBulkPublic(wid) {
+  // fallback via bulk
+  const url = `${ML_BASE}/items?ids=${wid}&attributes=price,status,available_quantity,sold_quantity,permalink`;
+  const r = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "WidOnly/1.0" } });
+  const ct = r.headers.get("content-type") || "";
+  let data = null;
+  if (ct.includes("application/json")) {
+    try { data = await r.json(); } catch {}
+  }
+  if (!r.ok) return { ok:false, status:r.status, data, url };
+  const arr = Array.isArray(data) ? data : [];
+  const first = arr[0] || {};
+  if (first.code === 200 && first.body) {
+    return { ok:true, status:200, data:first.body, url };
+  }
+  return { ok:false, status:404, data:null, url };
+}
+
+async function getItemPrice(wid) {
+  // 1) direta
+  let r = await fetchItemPublic(wid);
+  if (!r.ok) {
+    // 2) bulk fallback
+    const b = await fetchItemBulkPublic(wid);
+    if (!b.ok) return b;
+    r = b;
+  }
+  const price = Number(r.data?.price || 0);
+  if (!price) {
+    return { ok:false, status:404, error_code:"NO_PRICE", message:"Anúncio sem preço disponível", url:r.url };
+  }
+  return {
+    ok: true,
+    price,
+    source: "item",
+    item_id: wid,
+    sold_winner: Number.isFinite(r.data?.sold_quantity) ? r.data.sold_quantity : null
+  };
+}
+
+// --------- Catálogo (buy box) — requer OAuth ---------
+import { getAccessToken } from "./token.js";
+
+async function getBuyBoxPrice(productId) {
+  const token = await getAccessToken().catch(() => null);
+  if (!token) {
+    return { ok:false, status:401, error_code:"AUTH_REQUIRED", message:"Token ausente/expirado para /products/{id}" };
+  }
+  const url = `${ML_BASE}/products/${productId}`;
+  const r = await fetchJson(url, { token });
+  if (!r.ok) {
+    const code = r.status === 403 ? "FORBIDDEN" : (r.status === 404 ? "CATALOG_NOT_FOUND" : "UPSTREAM_ERROR");
+    const msg  = r.status === 403 ? "Permissões insuficientes para /products/{id}" :
+                 r.status === 404 ? "Catálogo não encontrado" :
+                 `Erro ${r.status} em /products/{id}`;
+    return { ok:false, status:r.status, error_code:code, message:msg, url };
+  }
+  if (!r.ct.includes("application/json")) {
+    return { ok:false, status:502, error_code:"UPSTREAM_JSON", message:"Resposta inválida (não JSON) em /products/{id}", url };
+  }
+  const winner = r.data?.buy_box_winner;
+  if (!(winner?.price > 0)) {
+    return { ok:false, status:404, error_code:"NO_BUY_BOX", message:"Catálogo sem buy box disponível via API no momento.", url };
+  }
+  // tentar vendidos do item vencedor
+  let sold = null;
+  if (winner.item_id) {
+    const ir = await fetchJson(`${ML_BASE}/items/${winner.item_id}`, { token });
+    if (ir.ok && Number.isFinite(ir.data?.sold_quantity)) sold = ir.data.sold_quantity;
+  }
+  return { ok:true, price:winner.price, item_id:winner.item_id || null, sold };
+}
+
+// --------- Handler ---------
+export default async function handler(req, res) {
   try {
-    const r = await fetch(itemUrl, { headers: buildHeaders(token || undefined) });
-    const ct = r.headers.get('content-type') || '';
-    if (!r.ok) {
-      if (r.status === 404) return { ok:false, error_code:'ITEM_NOT_FOUND', message:'Item não encontrado', http_status:404, details:{ upstream_url:itemUrl } };
-      return { ok:false, error_code:'UPSTREAM_ERROR', message:`Erro ${r.status} em /items/{id}`, http_status:r.status, details:{ upstream_url:itemUrl } };
+    // CORS/JSON
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method === "OPTIONS") return json(res, 200, { ok: true });
+    if (req.method !== "GET")     return json(res, 200, { ok:false, error_code:"METHOD_NOT_ALLOWED", http_status:405 });
+
+    const q = req.query || {};
+    let productId = String(q.product_id || "").trim();
+    let myItemId  = String(q.my_item_id  || "").trim();
+    const myPermalink = String(q.my_permalink || "").trim();
+
+    // Se product_id for link de catálogo com #...wid=MLB..., extrair WID e tratar como item
+    if (!isWID(productId)) {
+      const wid = extractWidFromHash(productId);
+      if (isWID(wid)) productId = wid;
     }
-    if (!ct.includes('application/json')) {
-      return { ok:false, error_code:'UPSTREAM_JSON', message:'Resposta inválida (não JSON) em /items/{id}', http_status:502, details:{ upstream_url:itemUrl } };
+
+    // Se não for MLB válido e veio permalink, extrair
+    if (!isWID(productId) && !isAnyMLB(productId) && myPermalink) {
+      const fromPerma = extractItemIdFromPermalink(myPermalink);
+      if (isWID(fromPerma)) myItemId = fromPerma;
     }
-    const data = await r.json();
-    if (!(data?.price > 0)) {
-      return { ok:false, error_code:'NO_PRICE', message:'Item sem preço disponível', http_status:404, details:{ upstream_url:itemUrl } };
+
+    // Decisão: catálogo (<10 dígitos) vs WID (>=10)
+    if (isAnyMLB(productId)) {
+      const digits = productId.replace(/MLB/i, "");
+      const isCatalog = digits.length < 10;
+
+      if (isCatalog) {
+        // 1) Buy box
+        const r = await getBuyBoxPrice(productId);
+        if (r.ok) {
+          return json(res, 200, {
+            ok: true,
+            price: r.price,
+            source: "buy_box",
+            product_id: productId,
+            item_id: r.item_id,
+            sold_winner: r.sold,
+            sold_catalog_total: null,
+            fetched_at: new Date().toISOString()
+          });
+        }
+        // 2) Fallback: seu item (se informado)
+        if (isWID(myItemId)) {
+          const fr = await getItemPrice(myItemId);
+          if (fr.ok) {
+            return json(res, 200, {
+              ok: true,
+              price: fr.price,
+              source: "my_item",
+              product_id: productId,
+              item_id: myItemId,
+              sold_winner: fr.sold_winner,
+              sold_catalog_total: null,
+              fetched_at: new Date().toISOString()
+            });
+          }
+        }
+        // 3) Erro estruturado
+        return json(res, 200, {
+          ok: false,
+          error_code: r.error_code || "UPSTREAM_ERROR",
+          message: r.message || "Falha ao consultar catálogo",
+          http_status: r.status || 502,
+          details: { upstream_url: r.url || `${ML_BASE}/products/${productId}` }
+        });
+      }
+
+      // WID (item): SEM token
+      const r = await getItemPrice(productId);
+      if (!r.ok) {
+        return json(res, 200, {
+          ok:false,
+          error_code: r.error_code || "UPSTREAM_ERROR",
+          message: r.message || `Erro ${r.status} em /items`,
+          http_status: r.status || 500,
+          details: { upstream_url: r.url }
+        });
+      }
+      return json(res, 200, {
+        ok: true,
+        price: r.price,
+        source: "item",
+        product_id: productId,
+        item_id: productId,
+        sold_winner: r.sold_winner,
+        sold_catalog_total: null,
+        fetched_at: new Date().toISOString()
+      });
     }
-    return {
-      ok: true,
-      price: data.price,
-      source: 'item',
-      product_id: mlId,
-      item_id: mlId,
-      sold_winner: Number.isFinite(data.sold_quantity) ? data.sold_quantity : null,
-      sold_catalog_total: null,
-      fetched_at
-    };
+
+    // Sem product_id MLB válido — tenta fallback para my_item_id/permalink
+    if (isWID(myItemId)) {
+      const r = await getItemPrice(myItemId);
+      if (r.ok) {
+        return json(res, 200, {
+          ok: true,
+          price: r.price,
+          source: "item",
+          product_id: myItemId,
+          item_id: myItemId,
+          sold_winner: r.sold_winner,
+          sold_catalog_total: null,
+          fetched_at: new Date().toISOString()
+        });
+      }
+      return json(res, 200, {
+        ok:false, error_code: r.error_code || "UPSTREAM_ERROR",
+        message: r.message || `Erro ${r.status} em /items`,
+        http_status: r.status || 500,
+        details: { upstream_url: r.url }
+      });
+    }
+
+    return json(res, 200, {
+      ok:false,
+      error_code: "MISSING_PARAM",
+      message: "Envie product_id=MLB... (catálogo ou WID). Se colar link de catálogo com #...wid=MLB..., eu extraio automaticamente.",
+      http_status: 400
+    });
   } catch (e) {
-    return { ok:false, error_code:'ITEM_ERROR', message:'Erro consultando item: ' + String(e?.message||e), http_status:500, details:{ upstream_url:itemUrl } };
+    return json(res, 200, {
+      ok:false, error_code:"INTERNAL", message:String(e?.message || e), http_status:500
+    });
   }
 }
