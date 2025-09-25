@@ -1,13 +1,11 @@
-// api/ml/preco.js (SOMENTE BUY BOX)
-// Objetivo: retornar "o preço que o catálogo está ganhando".
+// api/ml/preco.js
+// Objetivo: “preço que o catálogo está ganhando”.
 // Fluxo:
-// - Se for catálogo (MLB + <10 dígitos): GET /products/{id} com token, lê buy_box_winner.price.
-//   * Se houver: retorna ok:true, source:'buy_box'.
-//   * Se não houver: retorna ok:false, NO_BUY_BOX (catálogo existe mas sem vencedor visível via API).
-// - Se for item (MLB + >=10 dígitos): GET /items/{id} (com token) e retorna price.
-// Observações:
-// - Não usamos mais /sites/{site}/search?product_id nem /products/{id}/items (descontinuado).
-// - Sempre responde JSON e nunca redireciona.
+// - Catálogo (MLB + <10 dígitos): tenta /products/{id} (buy_box_winner).
+//   * Se vier: ok:true, source:'buy_box'.
+//   * Se NÃO vier: se receber my_item_id=MLBxxxxxxxxxx, usa /items/{my_item_id} como fallback → source:'my_item'.
+// - Item (MLB + >=10 dígitos): retorna /items/{id}.
+// Sempre responde JSON (sem redirecionar).
 
 function buildHeaders(token) {
   const h = { Accept: 'application/json', 'User-Agent': 'ImportCostControl/1.0 (server)' };
@@ -33,7 +31,9 @@ export default async function handler(req, res) {
     }
 
     const mlId = String((req.query?.product_id ?? '')).trim();
+    const myItemId = String((req.query?.my_item_id ?? '')).trim();
     const debug = String(req.query?.debug ?? '') === '1';
+
     if (!mlId) {
       return res.status(200).end(JSON.stringify({
         ok:false, error_code:'MISSING_PARAM', message:'product_id is required', http_status:400
@@ -44,6 +44,7 @@ export default async function handler(req, res) {
         ok:false, error_code:'INVALID_ID_FORMAT', message:'Use MLB + números', http_status:400
       }));
     }
+    const myItemIdValid = myItemId && /^MLB\d{10,}$/.test(myItemId);
 
     // Token via arquivo JS (extensão .js é obrigatória em ESM/Vercel)
     let token = null, tokenErr = null;
@@ -58,9 +59,9 @@ export default async function handler(req, res) {
       tokenErr = 'Falha ao importar/usar ./token.js: ' + e.message;
     }
 
-    const result = await getPrice(mlId, token);
+    const result = await getPrice({ mlId, myItemId: myItemIdValid ? myItemId : null, token });
 
-    if (debug) result._debug = { tokenOk: !!token, tokenErr };
+    if (debug) result._debug = { tokenOk: !!token, tokenErr, myItemId, myItemIdValid };
     return res.status(200).end(JSON.stringify(result));
   } catch (e) {
     return res.status(200).end(JSON.stringify({
@@ -69,7 +70,7 @@ export default async function handler(req, res) {
   }
 }
 
-async function getPrice(mlId, token) {
+async function getPrice({ mlId, myItemId, token }) {
   const base = 'https://api.mercadolibre.com';
   const fetched_at = new Date().toISOString();
   const isCatalog = mlId.replace('MLB','').length < 10;
@@ -79,6 +80,7 @@ async function getPrice(mlId, token) {
       return { ok:false, error_code:'AUTH_REQUIRED', message:'Token ausente para consultar catálogo.', http_status:401 };
     }
 
+    // 1) tenta o buy box
     const url = `${base}/products/${mlId}`;
     try {
       const r = await fetch(url, { headers: buildHeaders(token) });
@@ -93,6 +95,7 @@ async function getPrice(mlId, token) {
         if (r.status === 404) {
           return { ok:false, error_code:'CATALOG_NOT_FOUND', message:'Catálogo não encontrado', http_status:404, details:{ upstream_url:url } };
         }
+        // Outros erros
         return { ok:false, error_code:'UPSTREAM_ERROR', message:`Erro ${r.status} em /products/{id}`, http_status:r.status, details:{ upstream_url:url } };
       }
       if (!ct.includes('application/json')) {
@@ -110,7 +113,7 @@ async function getPrice(mlId, token) {
             const cti = ri.headers.get('content-type') || '';
             if (ri.ok && cti.includes('application/json')) {
               const ji = await ri.json();
-              soldWinner = typeof ji.sold_quantity === 'number' ? ji.sold_quantity : null;
+              soldWinner = Number.isFinite(ji.sold_quantity) ? ji.sold_quantity : null;
             }
           } catch {}
         }
@@ -126,18 +129,55 @@ async function getPrice(mlId, token) {
           fetched_at
         };
       }
-
-      // Sem buy box exposto pela API (ou catálogo sem vencedor)
-      return {
-        ok:false,
-        error_code:'NO_BUY_BOX',
-        message:'Catálogo sem buy box disponível via API no momento.',
-        http_status:404,
-        details:{ upstream_url:url }
-      };
     } catch (e) {
-      return { ok:false, error_code:'CATALOG_ERROR', message:'Erro consultando catálogo: ' + String(e?.message||e), http_status:500 };
+      // segue pro fallback
     }
+
+    // 2) FALLBACK: usar meu item (se informado), para não travar operação
+    if (myItemId) {
+      const itemUrl = `${base}/items/${myItemId}`;
+      try {
+        const r = await fetch(itemUrl, { headers: buildHeaders(token) });
+        const ct = r.headers.get('content-type') || '';
+        if (!r.ok) {
+          return {
+            ok:false,
+            error_code:'MY_ITEM_ERROR',
+            message:`Erro ${r.status} consultando meu item`,
+            http_status:r.status,
+            details:{ upstream_url:itemUrl }
+          };
+        }
+        if (!ct.includes('application/json')) {
+          return { ok:false, error_code:'UPSTREAM_JSON', message:'Resposta inválida (não JSON) em /items/{my_item_id}', http_status:502, details:{ upstream_url:itemUrl } };
+        }
+        const data = await r.json();
+        if (!(data?.price > 0)) {
+          return { ok:false, error_code:'MY_ITEM_NO_PRICE', message:'Meu item sem preço disponível', http_status:404, details:{ upstream_url:itemUrl } };
+        }
+        return {
+          ok: true,
+          price: data.price,
+          source: 'my_item',
+          product_id: mlId,
+          item_id: myItemId,
+          sold_winner: Number.isFinite(data.sold_quantity) ? data.sold_quantity : null,
+          sold_catalog_total: null,
+          fetched_at
+        };
+      } catch (e) {
+        return { ok:false, error_code:'MY_ITEM_ERROR', message:'Erro consultando meu item: ' + String(e?.message||e), http_status:500 };
+      }
+    }
+
+    // Sem buy box e sem meu item informado
+    return {
+      ok:false,
+      error_code:'NO_BUY_BOX',
+      message:'Catálogo sem buy box disponível via API no momento.',
+      http_status:404,
+      details:{ upstream_url:url }
+    };
   }
 
   // ID de item direto
@@ -162,7 +202,7 @@ async function getPrice(mlId, token) {
       source: 'item',
       product_id: mlId,
       item_id: mlId,
-      sold_winner: typeof data.sold_quantity === 'number' ? data.sold_quantity : null,
+      sold_winner: Number.isFinite(data.sold_quantity) ? data.sold_quantity : null,
       sold_catalog_total: null,
       fetched_at
     };
