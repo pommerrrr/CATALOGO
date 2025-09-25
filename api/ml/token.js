@@ -24,11 +24,13 @@ export async function getAccessToken() {
   });
 
   if (!resp.ok) {
-    // Inclui o início da resposta para diagnóstico rápido
     const text = await resp.text().catch(() => '');
     throw new Error(`Token exchange failed: ${resp.status} ${text.slice(0, 200)}`);
   }
 
   const data = await resp.json();
+  if (!data?.access_token) {
+    throw new Error('No access_token in response');
+  }
   return data.access_token;
 }
