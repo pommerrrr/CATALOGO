@@ -1,10 +1,1 @@
-{
-  "name": "catalogo-wid-api",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Projeto minimalista com API /api/preco_wid (WID-only) e SPA estática.",
-  "license": "MIT",
-  "scripts": {
-    "start": "echo 'Rodar na Vercel. Sem build.'"
-  }
-}
+{"name":"catalogo-wid-api","version":"1.0.1","private":true}
