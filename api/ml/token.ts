@@ -4,10 +4,7 @@ export async function getAccessToken(): Promise<string> {
   const appSecret = process.env.ML_APP_SECRET!;
   const refresh = process.env.ML_REFRESH_TOKEN || "";
 
-  // Se você já quiser forçar um access token fixo:
-  if (process.env.ML_ACCESS_TOKEN) return process.env.ML_ACCESS_TOKEN;
-
-  if (!refresh) throw new Error("ML_REFRESH_TOKEN vazio. Rode o fluxo OAuth para obtê-lo.");
+  if (!refresh) throw new Error("ML_REFRESH_TOKEN vazio. Rode o login e salve o refresh_token na Vercel.");
 
   const body = new URLSearchParams({
     grant_type: "refresh_token",
@@ -26,7 +23,7 @@ export async function getAccessToken(): Promise<string> {
     const t = await r.text();
     throw new Error(`Falha ao renovar access_token: ${r.status} ${t}`);
   }
+
   const json = await r.json();
-  // json: { access_token, token_type, expires_in, scope, user_id }
-  return json.access_token as string;
+  return json.access_token as string; // dura ~6h
 }
