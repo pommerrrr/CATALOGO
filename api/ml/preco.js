@@ -154,4 +154,116 @@ async function getProductInfo(mlId, token) {
       if (r.status === 404) {
         return { ok:false, error_code:'ITEM_NOT_FOUND', message:'Item not found', http_status:404, details:{ upstream_url:itemUrl } };
       }
-      return { ok:false, error_code:'UPSTREAM_ERROR', message:`Error ${r.status} on item`, http_status:r.status, d_
+      return { ok:false, error_code:'UPSTREAM_ERROR', message:`Error ${r.status} on item`, http_status:r.status, details:{ upstream_url:itemUrl } };
+    }
+    if (!ct.includes('application/json')) {
+      return { ok:false, error_code:'UPSTREAM_JSON', message:'Invalid response (not JSON) on item', http_status:502, details:{ upstream_url:itemUrl } };
+    }
+    const data = await r.json();
+    if (!(data?.price > 0)) {
+      return { ok:false, error_code:'NO_PRICE', message:'Item has no price', http_status:404, details:{ upstream_url:itemUrl } };
+    }
+    return {
+      ok: true,
+      price: data.price,
+      source: 'item',
+      product_id: mlId,
+      item_id: mlId,
+      sold_winner: typeof data.sold_quantity === 'number' ? data.sold_quantity : null,
+      sold_catalog_total: null,
+      fetched_at
+    };
+  } catch (e) {
+    return { ok:false, error_code:'ITEM_ERROR', message:'Error consulting item: ' + String(e?.message||e), http_status:500, details:{ upstream_url:itemUrl } };
+  }
+}
+
+async function getCatalogItemsAndPickBest(mlId, base, token, fetched_at) {
+  const listUrl = `${base}/products/${mlId}/items?limit=200`;
+  try {
+    const r = await fetch(listUrl, { headers: buildHeaders(token) });
+    const ct = r.headers.get('content-type') || '';
+    if (!r.ok) {
+      if (r.status === 401) {
+        return {
+          ok:false,
+          error_code:'AUTH_REQUIRED',
+          message:'401 em /products/{id}/items. Reautorize o app e confira escopos.',
+          http_status:401,
+          details:{ upstream_url:listUrl }
+        };
+      }
+      if (r.status === 403) {
+        return {
+          ok:false,
+          error_code:'FORBIDDEN',
+          message:'403 em /products/{id}/items. Permissões insuficientes.',
+          http_status:403,
+          details:{ upstream_url:listUrl }
+        };
+      }
+      return { ok:false, error_code:'OFFERS_LIST_ERROR', message:`Error ${r.status} on product items`, http_status:r.status, details:{ upstream_url:listUrl } };
+    }
+    if (!ct.includes('application/json')) {
+      return { ok:false, error_code:'UPSTREAM_JSON', message:'Invalid response (not JSON) on product items', http_status:502, details:{ upstream_url:listUrl } };
+    }
+
+    const data = await r.json();
+    // Shapes possíveis:
+    // - { results: [ { id: 'MLB...' }, ... ] }
+    // - [ 'MLB...', ... ] ou [ { id:'MLB...' }, ... ]
+    const raw = Array.isArray(data?.results) ? data.results : (Array.isArray(data) ? data : []);
+    const ids = raw
+      .map(x => (typeof x === 'string' ? x : (x?.id || null)))
+      .filter(Boolean);
+
+    if (ids.length === 0) {
+      return { ok:false, error_code:'NO_ACTIVE_OFFERS', message:'Nenhum item encontrado para este catálogo', http_status:404, details:{ upstream_url:listUrl } };
+    }
+
+    // Busca detalhes em lotes de 20 para pegar price/status/sold_quantity
+    const chunks = chunk(ids, 20);
+    let best = null;       // { id, price }
+    let soldTotal = 0;
+
+    for (const c of chunks) {
+      const itemsUrl = `${base}/items?ids=${c.join(',')}`;
+      const ri = await fetch(itemsUrl, { headers: buildHeaders(token) });
+      const cti = ri.headers.get('content-type') || '';
+      if (!ri.ok || !cti.includes('application/json')) continue;
+
+      const arr = await ri.json(); // [{ code:200, body:{...}}, ...]
+      if (!Array.isArray(arr)) continue;
+
+      for (const entry of arr) {
+        const body = entry?.body;
+        if (!body) continue;
+        const price = Number(body.price) || 0;
+        const status = body.status || '';
+        const isActive = status === 'active' || status === 'paused' || status === '' || !status;
+        if (price > 0 && isActive) {
+          if (!best || price < best.price) best = { id: body.id, price };
+        }
+        const sq = Number(body.sold_quantity);
+        if (!Number.isNaN(sq)) soldTotal += sq;
+      }
+    }
+
+    if (!best) {
+      return { ok:false, error_code:'NO_ACTIVE_OFFERS', message:'Itens do catálogo sem preço ativo', http_status:404, details:{ upstream_url:listUrl } };
+    }
+
+    return {
+      ok: true,
+      price: best.price,
+      source: 'catalog_items', // <— novo fallback autenticado
+      product_id: mlId,
+      item_id: best.id,
+      sold_winner: null,
+      sold_catalog_total: soldTotal,
+      fetched_at
+    };
+  } catch (e) {
+    return { ok:false, error_code:'OFFERS_ERROR', message:'Error listing items: ' + String(e?.message||e), http_status:500, details:{ upstream_url:listUrl } };
+  }
+}
