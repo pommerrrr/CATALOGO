@@ -1,4 +1,3 @@
-// api/ml/preco.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { getAccessToken } from './token'
 
@@ -17,6 +16,16 @@ interface MLApiResponse {
   message?: string
   http_status?: number
   details?: any
+}
+
+/** Monta headers concretos (sem union) aceitos por fetch */
+function buildHeaders(token?: string): Record<string, string> {
+  const h: Record<string, string> = {
+    Accept: 'application/json',
+    'User-Agent': 'ImportCostControl/1.0 (server)',
+  }
+  if (token) h.Authorization = `Bearer ${token}`
+  return h
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -77,28 +86,22 @@ async function getProductInfo(mlId: string): Promise<MLApiResponse> {
   const digits = mlId.replace('MLB', '')
   const isCatalog = digits.length < 10
 
-  // Access token via refresh_token (passo 4.2)
-  const token = await getAccessToken().catch(() => null)
-
-  const baseHeaders: Record<string, string> = {
-    Accept: 'application/json',
-    'User-Agent': 'ImportCostControl/1.0 (server)'
-  }
-  const authHeaders = token ? { Authorization: `Bearer ${token}` } : {}
+  // Access token via refresh_token
+  const token: string | null = await getAccessToken().catch(() => null)
 
   if (isCatalog) {
-    // 1) Tenta o /products (requer token) para obter Buy Box Winner
+    // 1) /products (requer token) → tenta Buy Box Winner
     const prodUrl = `${base}/products/${mlId}`
     const prodRes = await fetch(prodUrl, {
       method: 'GET',
-      headers: { ...baseHeaders, ...authHeaders }
+      headers: buildHeaders(token || undefined)
     })
     const prodCT = prodRes.headers.get('content-type') || ''
 
     if (!prodRes.ok) {
-      // 401/403 → fallback para ofertas do catálogo (sem bloquear o fluxo)
+      // 401/403 → fallback para ofertas
       if (prodRes.status === 401 || prodRes.status === 403) {
-        return getCatalogOffers(mlId, base, fetched_at, baseHeaders)
+        return getCatalogOffers(mlId, base, fetched_at)
       }
       if (prodRes.status === 404) {
         return {
@@ -130,18 +133,18 @@ async function getProductInfo(mlId: string): Promise<MLApiResponse> {
 
     const prod = await prodRes.json()
 
-    // 2) Buy Box Winner com preço
+    // 2) Buy Box Winner
     if (prod?.buy_box_winner?.price) {
       const price = prod.buy_box_winner.price
       const itemId = prod.buy_box_winner.item_id || null
 
-      // (Opcional) pegar sold_quantity do item vencedor
+      // sold_quantity do item vencedor (opcional)
       let soldWinner: number | null = null
       if (itemId) {
         const itemUrl = `${base}/items/${itemId}`
         const itemRes = await fetch(itemUrl, {
           method: 'GET',
-          headers: { ...baseHeaders, ...authHeaders }
+          headers: buildHeaders(token || undefined)
         })
         const itemCT = itemRes.headers.get('content-type') || ''
         if (itemRes.ok && itemCT.includes('application/json')) {
@@ -165,15 +168,15 @@ async function getProductInfo(mlId: string): Promise<MLApiResponse> {
       }
     }
 
-    // 3) Sem Buy Box → ofertas do catálogo
-    return getCatalogOffers(mlId, base, fetched_at, baseHeaders)
+    // 3) Sem Buy Box → ofertas
+    return getCatalogOffers(mlId, base, fetched_at)
   }
 
-  // Não é catálogo → item direto (requer token)
+  // Item direto (não catálogo) — requer token
   const itemUrl = `${base}/items/${mlId}`
   const itemRes = await fetch(itemUrl, {
     method: 'GET',
-    headers: { ...baseHeaders, ...authHeaders }
+    headers: buildHeaders(token || undefined)
   })
   const itemCT = itemRes.headers.get('content-type') || ''
   if (!itemRes.ok) {
@@ -228,17 +231,15 @@ async function getProductInfo(mlId: string): Promise<MLApiResponse> {
   }
 }
 
-// Fallback/consulta de ofertas do catálogo
 async function getCatalogOffers(
   mlId: string,
   base: string,
-  fetched_at: string,
-  baseHeaders: Record<string, string>
+  fetched_at: string
 ): Promise<MLApiResponse> {
   const offersUrl = `${base}/sites/MLB/search?product_id=${mlId}&limit=50&sort=price_asc`
   const offRes = await fetch(offersUrl, {
     method: 'GET',
-    headers: { ...baseHeaders } // token geralmente não é necessário aqui
+    headers: buildHeaders() // sem token aqui (pode usar também)
   })
   const oct = offRes.headers.get('content-type') || ''
 
