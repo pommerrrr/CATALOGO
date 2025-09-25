@@ -25,5 +25,5 @@ export async function getAccessToken(): Promise<string> {
   }
 
   const json = await r.json();
-  return json.access_token as string; // dura ~6h
+  return json.access_token as string; // ~6h
 }
