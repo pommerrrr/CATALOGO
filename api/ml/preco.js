@@ -1,17 +1,8 @@
 // api/ml/preco.js
 // === SOMENTE WID (MLB com 10+ dígitos) ===
-// Uso:  GET /api/ml/preco?wid=MLB1234567890   (compat: ?product_id=MLB...)
-// Saída: JSON
-// Ordem de tentativas:
-//  1) COM TOKEN (header) → /items (direto/bulk, com/sem attributes)
-//  2) COM TOKEN (query ?access_token=) → /items (direto/bulk, com/sem attributes)
-//  3) PÚBLICO (sem token) → /items (direto/bulk, com/sem attributes)
-//  4) BUSCA pública → /sites/MLB/search?q=WID (com token header → token query → público)
-//  5) SCRAPE (opcional) da página do anúncio: ativar por ENV ENABLE_SCRAPE_FALLBACK=1 ou query &sf=1
-//
-// Dicas:
-// - Fixe região das functions em GRU1 (São Paulo) no vercel.json (functions.regions=["gru1"]).
-// - Use ?debug=1 para ver um _debug com tudo que foi tentado.
+// GET /api/ml/preco?wid=MLB1234567890 (&debug=1 [&sf=1])
+// Estratégia: token header → token query → público → busca → (opcional) scrape
+// Extra: extractor de preço melhora para anúncios com variações e/ou bloco prices.prices.
 
 const ML_BASE = "https://api.mercadolibre.com";
 
@@ -95,13 +86,60 @@ function normalizeBulk(r) {
   if (first.code === 200 && first.body) {
     return { ok: true, data: first.body, status: 200, url: r.url, ct: r.ct, reqId: r.reqId };
   }
-  return { ok: false, status: first.code || r.status || 404, url: r.url, ct: r.ct, reqId: r.reqId };
+  return { ok: false, status: first.code || r.status || 404, url: r.url, ct: r.ct, reqId: r.reqId, raw: first };
+}
+
+// ---------- Price extractors ----------
+function extractFromPricesObject(pricesObj) {
+  // Estrutura típica:
+  // prices: { prices: [{amount, currency_id, type, status, ... , last_updated}], presentation: {...}, reference_prices: [...] }
+  const list = Array.isArray(pricesObj?.prices) ? pricesObj.prices : [];
+  if (!list.length) return null;
+
+  // Preferir BRL, status ativo, tipos padrão (standard/list/promotion). Pega o mais recente.
+  const candidates = list
+    .filter(p => Number(p?.amount) > 0 && (!p.currency_id || p.currency_id === "BRL"))
+    .filter(p => !p.status || p.status === "active" || p.status === "available")
+    .sort((a,b) => new Date(b.last_updated || 0) - new Date(a.last_updated || 0));
+
+  if (candidates.length) {
+    return Number(candidates[0].amount);
+  }
+  return null;
+}
+
+function extractFromVariations(variations) {
+  if (!Array.isArray(variations) || variations.length === 0) return null;
+  // pega menor preço entre variações ativas/com estoque; senão menor geral >0
+  const active = variations
+    .map(v => Number(v?.price || 0))
+    .filter(p => p > 0);
+  if (active.length) {
+    return Math.min(...active);
+  }
+  return null;
 }
 
 function extractPriceSold(body) {
-  const price = Number(body?.price || 0);
-  const sold  = Number.isFinite(body?.sold_quantity) ? body.sold_quantity : null;
-  return { price, sold };
+  // 1) Campo direto
+  let price = Number(body?.price || 0);
+  let sold  = Number.isFinite(body?.sold_quantity) ? body.sold_quantity : null;
+
+  if (price > 0) return { price, sold };
+
+  // 2) Bloco prices.prices
+  const fromPrices = extractFromPricesObject(body?.prices);
+  if (Number(fromPrices) > 0) {
+    return { price: Number(fromPrices), sold };
+  }
+
+  // 3) Variações
+  const fromVars = extractFromVariations(body?.variations);
+  if (Number(fromVars) > 0) {
+    return { price: Number(fromVars), sold };
+  }
+
+  return { price: 0, sold };
 }
 
 // ---------- BUSCA pública de fallback ----------
@@ -141,7 +179,6 @@ const HTML_HEADERS = {
 };
 
 function parsePriceFromHtml(html) {
-  // tenta achar JSON-LD com offers.price
   const scripts = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
   for (const m of scripts) {
     const raw = m[1];
@@ -163,7 +200,6 @@ function parsePriceFromHtml(html) {
       }
     } catch {}
   }
-  // fallback: regex simples (menos confiável)
   const mPrice = html.match(/"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)/i);
   if (mPrice) {
     const p = Number(mPrice[1]);
@@ -174,8 +210,8 @@ function parsePriceFromHtml(html) {
 
 async function scrapePrice(wid, dbg) {
   const urls = [
-    `https://produto.mercadolivre.com.br/${wid}`,
-    `https://www.mercadolivre.com.br/${wid}`
+    `https://produto.mercadolivre.com.br/MLB${wid.replace(/^MLB/i, "")}`,
+    `https://www.mercadolivre.com.br/MLB${wid.replace(/^MLB/i, "")}`
   ];
   for (const url of urls) {
     try {
@@ -248,6 +284,7 @@ async function getPriceByWID(wid, token, dbg) {
             via: t.kind
           };
         }
+        // tenta outra rota se esse corpo não trouxe preço
         continue;
       }
 
@@ -304,7 +341,6 @@ export default async function handler(req, res) {
     if (req.method === "OPTIONS") return sendJSON(res, 200, { ok: true });
     if (req.method !== "GET")     return sendJSON(res, 200, { ok:false, error_code:"METHOD_NOT_ALLOWED", http_status:405 });
 
-    // Apenas WID — use ?wid= (compat: ?product_id=)
     const q   = req.query || {};
     const wid = String(q.wid || q.product_id || "").trim().toUpperCase();
     const debug = String(q.debug || "") === "1";
