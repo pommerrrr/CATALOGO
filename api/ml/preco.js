@@ -1,8 +1,8 @@
 // api/ml/preco.js
 // === SOMENTE WID (MLB com 10+ dígitos) ===
 // GET /api/ml/preco?wid=MLB1234567890 (&debug=1 [&sf=1])
-// Estratégia: token header → token query → público → busca → (opcional) scrape
-// Melhorias: bulk attrs ampliado + extractor que olha price/base_price/original_price/prices.prices/variations.
+// Ordem: token header → token query → público → busca → (opcional) scrape
+// Melhorias: extractor completo + debug probe + scraper mais potente.
 
 const ML_BASE = "https://api.mercadolibre.com";
 
@@ -174,25 +174,23 @@ function findPriceInObject(obj) {
   let best = null;
   function walk(node, path = []) {
     if (!node || typeof node !== "object") return;
+
     if (typeof node.amount === "number" && node.amount > 0) {
-      // heurística: se houver pistas de price/unit_price no caminho, prioriza
       const p = path.join(".").toLowerCase();
       if (p.includes("price") || p.includes("unitprice") || p.includes("unit_price") || p.includes("buybox")) {
-        best = best ? Math.min(best, node.amount) : node.amount;
+        best = best ? Math.max(best, node.amount) : node.amount; // pega o maior "relevante"
       } else if (best == null) {
         best = node.amount;
       }
     }
-    // chaves simples tipo price: 999
     if (typeof node.price === "number" && node.price > 0) {
-      best = best ? Math.min(best, node.price) : node.price;
+      best = best ? Math.max(best, node.price) : node.price;
     }
     for (const k of Object.keys(node)) {
       const v = node[k];
       if (v && typeof v === "object") {
         walk(v, path.concat(k));
       }
-      // arrays
       if (Array.isArray(v)) {
         for (let i = 0; i < v.length; i++) {
           walk(v[i], path.concat(k, String(i)));
@@ -204,8 +202,15 @@ function findPriceInObject(obj) {
   return best;
 }
 
+function parseBRL(str) {
+  // "1.234,56" → 1234.56
+  const s = String(str).replace(/\./g, "").replace(",", ".");
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
 function parsePriceFromHtml(html) {
-  // 1) JSON-LD (offers.price)
+  // 1) JSON-LD
   const scripts = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
   for (const m of scripts) {
     const raw = m[1];
@@ -227,7 +232,7 @@ function parsePriceFromHtml(html) {
     }
   }
 
-  // 2) window.__PRELOADED_STATE__ = {...};
+  // 2) PRELOADED_STATE
   const mPre = html.match(/window\.__PRELOADED_STATE__\s*=\s*({[\s\S]*?});/);
   if (mPre) {
     const obj = safeJsonParse(mPre[1]);
@@ -235,7 +240,7 @@ function parsePriceFromHtml(html) {
     if (Number(found) > 0) return Number(found);
   }
 
-  // 3) __NEXT_DATA__ script (Next.js)
+  // 3) __NEXT_DATA__
   const mNextScript = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/i);
   if (mNextScript) {
     const obj = safeJsonParse(mNextScript[1]);
@@ -249,18 +254,36 @@ function parsePriceFromHtml(html) {
     if (Number(found) > 0) return Number(found);
   }
 
-  // 4) Heurística: BRL seguido de "amount"
-  const mBRLAmount = html.match(/"currency(?:_id|)":"?BRL"?[\s\S]{0,200}"amount"\s*:\s*([0-9]+(?:\.[0-9]+)?)/i);
-  if (mBRLAmount) {
-    const p = Number(mBRLAmount[1]);
+  // 4) Seletores comuns de preço (HTML estático renderizado)
+  // andes-money-amount__fraction + (opcional) cents
+  const mFraction = html.match(/andes-money-amount__fraction[^>]*>([\d\.]+)/i);
+  if (mFraction) {
+    let frac = mFraction[1].replace(/\./g, "");
+    let cents = "00";
+    const mCents = html.match(/andes-money-amount__cents[^>]*>(\d{2})/i);
+    if (mCents) cents = mCents[1];
+    const p = Number(`${frac}.${cents}`);
     if (p > 0) return p;
   }
 
-  // 5) Regex mais simples (último recurso)
-  const mSimple = html.match(/"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)/i);
-  if (mSimple) {
-    const p = Number(mSimple[1]);
-    if (p > 0) return p;
+  // data-testid="price-value">R$ 1.234,56</...>
+  const mTestId = html.match(/data-testid=["']price-value["'][^>]*>\s*R\$\s*([\d\.\,]+)/i);
+  if (mTestId) {
+    const p = parseBRL(mTestId[1]);
+    if (p && p > 0) return p;
+  }
+
+  // 5) Regex BRL geral: pega vários e escolhe o maior (evita capturar parcela)
+  const moneyMatches = [...html.matchAll(/R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*,\d{2})/g)];
+  if (moneyMatches.length) {
+    const nums = moneyMatches
+      .map(m => parseBRL(m[1]))
+      .filter(n => typeof n === "number" && n > 0 && n < 1000000);
+    if (nums.length) {
+      // heurística: o maior tende a ser o preço total (e não a parcela)
+      const max = Math.max(...nums);
+      if (max > 0) return max;
+    }
   }
 
   return null;
@@ -294,12 +317,11 @@ async function scrapePrice(wid, dbg) {
 
 // ---------- Core: obter preço por WID ----------
 async function getPriceByWID(wid, token, dbg) {
-  // Campos ampliados: pedimos tudo que ajuda o extractor
   const ATTRS_FULL = [
     "price","base_price","original_price",
     "prices","variations",
     "status","available_quantity","sold_quantity",
-    "permalink"
+    "permalink","listing_type_id","catalog_product_id"
   ].join(",");
 
   // 1) COM TOKEN no header (se houver)
@@ -339,7 +361,34 @@ async function getPriceByWID(wid, token, dbg) {
       if (t.bulk) {
         const nb = normalizeBulk(r);
         if (!nb.ok) continue;
+
         const { price, sold } = extractPriceSold(nb.data);
+        // --- DEBUG PROBE (somente se debug ligado lá em cima) ---
+        if (!dbg.bulkProbe && (price === 0 || price === null || price === undefined)) {
+          dbg.bulkProbe = {
+            from: t.kind,
+            listing_type_id: nb.data?.listing_type_id || null,
+            catalog_product_id: nb.data?.catalog_product_id || null,
+            base_price: nb.data?.base_price || null,
+            original_price: nb.data?.original_price || null,
+            variations_sample: Array.isArray(nb.data?.variations)
+              ? nb.data.variations.slice(0, 3).map(v => ({
+                  id: v?.id, price: v?.price ?? null, aq: v?.available_quantity ?? null
+                }))
+              : null,
+            prices_sample: Array.isArray(nb.data?.prices?.prices)
+              ? nb.data.prices.prices.slice(0, 3).map(p => ({
+                  amount: p?.amount ?? null,
+                  currency_id: p?.currency_id ?? null,
+                  status: p?.status ?? null,
+                  type: p?.type ?? null,
+                  last_updated: p?.last_updated ?? null
+                }))
+              : null
+          };
+        }
+        // --------------------------------------------------------
+
         if (price > 0) {
           return {
             ok: true,
@@ -349,7 +398,6 @@ async function getPriceByWID(wid, token, dbg) {
             via: t.kind
           };
         }
-        // Corpo veio mas sem preço legível → tenta seguir pro próximo
         continue;
       }
 
