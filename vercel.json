@@ -1,19 +1,14 @@
 {
   "version": 2,
+  "functions": {
+    "api/*.js": { "runtime": "nodejs20.x" },
+    "api/**/*.js": { "runtime": "nodejs20.x" }
+  },
   "rewrites": [
-    {
-      "source": "/api/(.*)",
-      "destination": "/api/$1"
-    },
-    {
-      "source": "/(.*)",
-      "destination": "/index.html"
-    }
+    { "source": "/api/(.*)", "destination": "/api/$1" },
+    { "source": "/(.*)", "destination": "/index.html" }
   ],
   "crons": [
-    {
-      "path": "/api/cron/refresh",
-      "schedule": "0 */2 * * *"
-    }
+    { "path": "/api/cron/refresh", "schedule": "0 */2 * * *" }
   ]
 }
