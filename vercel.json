@@ -1,25 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "regions": ["gru1"],
-
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/$1" },
-    { "source": "/(.*)", "destination": "/" }
+    { "source": "/(.*)", "destination": "/index.html" }
   ]
-
-  /* 
-    Observação:
-    - NÃO use "regions" dentro de "functions".
-    - Se quiser ajustar timeout/memória, você pode ter um bloco functions,
-      mas sem "regions", por exemplo:
-
-    "functions": {
-      "api/**/*.{js,ts}": {
-        "maxDuration": 10,
-        "memory": 1536
-      }
-    }
-
-    Se adicionar esse bloco, lembre de separar com vírgula após "rewrites".
-  */
 }
