@@ -1,13 +1,35 @@
-
-<!doctype html><html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Controle de Custos de Importação</title>
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;background:#0b1220;color:#e6eefc;margin:0}
-.container{max-width:1100px;margin:40px auto;padding:0 20px}.card{background:#111a2b;border:1px solid #253151;border-radius:12px;padding:16px}
-.grid{display:grid;gap:12px;grid-template-columns:repeat(12,1fr)}.col-12{grid-column:span 12}.col-6{grid-column:span 6}.col-4{grid-column:span 4}.col-3{grid-column:span 3}
-label{display:block;font-size:12px;color:#a8b4d4;margin-bottom:4px}input,textarea,select{width:100%;padding:10px;border-radius:8px;border:1px solid #2e3b61;background:#0d1424;color:#e6eefc;outline:0}
-input[readonly]{opacity:.85}button{background:#3b82f6;color:#fff;border:0;padding:10px 14px;border-radius:10px;cursor:pointer}button.secondary{background:#1f2937}
-table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #253151;text-align:left}
-.pill{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;border:1px solid #2e3b61}.pill.buy_box{border-color:#22c55e;color:#22c55e}.pill.catalog_offers{border-color:#f59e0b;color:#f59e0b}.pill.item{border-color:#38bdf8;color:#38bdf8}
-.notice{background:#0d1628;border:1px solid #2a375e;padding:10px;border-radius:8px;color:#a8b4d4}
-</style></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>
+<!doctype html>
+<html lang="pt-br"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Controle de Custos (MVP) • WID API OK</title>
+<style>html,body{background:#0b1220;color:#e9eefc;font-family:ui-sans-serif,system-ui;-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Helvetica Neue,Arial}
+.container{max-width:880px;margin:48px auto;padding:24px;background:#101a33;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+h1{margin:0 0 8px;font-weight:700}code,input{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,monospace}
+.row{display:flex;gap:12px}input{flex:1;padding:12px 14px;border-radius:10px;border:1px solid #2a3a66;background:#0d1530;color:#e9eefc}
+button{padding:12px 16px;border:0;border-radius:10px;background:#2b6ef3;color:#fff;cursor:pointer;font-weight:600}
+pre{background:#0d1530;padding:16px;border-radius:12px;overflow:auto}a{color:#9bc1ff}small{color:#a6b0cf}</style>
+</head><body>
+<div class="container">
+  <h1>Controle de Custos (MVP)</h1>
+  <p><small>API pública WID-only ativa em <code>/api/preco_wid</code>. Informe um <b>WID</b> (ex.: <code>MLB5694522104</code>) ou cole um link de catálogo com <code>#...wid=MLB...</code>.</small></p>
+  <div class="row"><input id="wid" placeholder="MLB... ou cole um link com #...wid=MLB..."/><button onclick="consultar()">Consultar</button></div>
+  <p id="status"></p><pre id="out"></pre>
+  <p><small>Dicas rápidas: <a href="/api/health" target="_blank">/api/health</a> • <a href="/api/ping" target="_blank">/api/ping</a></small></p>
+</div>
+<script>
+async function consultar(){
+  const v=document.getElementById('wid').value.trim();
+  document.getElementById('status').textContent='Consultando...';
+  document.getElementById('out').textContent='';
+  try{
+    const url='/api/preco_wid?product_id='+encodeURIComponent(v);
+    const r=await fetch(url); const j=await r.json();
+    document.getElementById('status').textContent='Pronto!';
+    document.getElementById('out').textContent=JSON.stringify(j,null,2);
+  }catch(e){
+    document.getElementById('status').textContent='Erro ao consultar';
+    document.getElementById('out').textContent=String(e);
+  }
+}
+</script>
+</body></html>
