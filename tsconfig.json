@@ -6,6 +6,9 @@
       "ES2020",
       "DOM",
       "DOM.Iterable"
+  "types": ["node"],      // <- adiciona tipos do Node
+    "skipLibCheck": true,   // acelera e evita ruído de tipagem
+    "moduleResolution": "node"
     ],
     "module": "ESNext",
     "skipLibCheck": true,
