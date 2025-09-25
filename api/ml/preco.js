@@ -1,17 +1,17 @@
 // api/ml/preco.js
 // === SOMENTE WID (MLB com 10+ dígitos) ===
 // Uso:  GET /api/ml/preco?wid=MLB1234567890   (compat: ?product_id=MLB...)
-// Retorna SEMPRE JSON com o preço do ANÚNCIO.
+// Saída: JSON
 // Ordem de tentativas:
-//  1) COM TOKEN no header  → /items (direto/bulk, com/sem attributes)
-//  2) COM TOKEN na query   → /items (direto/bulk, com/sem attributes)
-//  3) PÚBLICO (sem token)  → /items (direto/bulk, com/sem attributes)
-//  4) BUSCA pública        → /sites/MLB/search?q=WID (com token → token na query → público)
-//  5) (Opcional) SCRAPE HTML da página do anúncio (se ENABLE_SCRAPE_FALLBACK=1)
+//  1) COM TOKEN (header) → /items (direto/bulk, com/sem attributes)
+//  2) COM TOKEN (query ?access_token=) → /items (direto/bulk, com/sem attributes)
+//  3) PÚBLICO (sem token) → /items (direto/bulk, com/sem attributes)
+//  4) BUSCA pública → /sites/MLB/search?q=WID (com token header → token query → público)
+//  5) SCRAPE (opcional) da página do anúncio: ativar por ENV ENABLE_SCRAPE_FALLBACK=1 ou query &sf=1
 //
-// Observações:
-// - Muitos ambientes passaram a exigir token inclusive em endpoints antes "públicos".
-// - Se ainda assim falhar com WIDs de terceiros, ative o scrape fallback e/ou fixe a região GRU1.
+// Dicas:
+// - Fixe região das functions em GRU1 (São Paulo) no vercel.json (functions.regions=["gru1"]).
+// - Use ?debug=1 para ver um _debug com tudo que foi tentado.
 
 const ML_BASE = "https://api.mercadolibre.com";
 
@@ -72,7 +72,10 @@ function authHeaders(token) {
 async function fetchJson(url, headers) {
   const r = await fetch(url, { headers });
   const ct = r.headers.get("content-type") || "";
-  const reqId = r.headers.get("x-request-id") || r.headers.get("x-request-id-meli") || null;
+  const reqId = r.headers.get("x-request-id")
+    || r.headers.get("x-request-id-meli")
+    || r.headers.get("x-request-id-ml")
+    || null;
   let data = null;
   if (ct.includes("application/json")) {
     try { data = await r.json(); } catch {}
@@ -102,7 +105,7 @@ function extractPriceSold(body) {
 }
 
 // ---------- BUSCA pública de fallback ----------
-async function getPriceViaSearch(wid, mode, token) {
+async function getPriceViaSearch(wid, mode, token, dbg) {
   let url = `${ML_BASE}/sites/MLB/search?q=${encodeURIComponent(wid)}&limit=3`;
   let headers = PUBLIC_HEADERS;
   if (mode === "auth_header" && token) {
@@ -112,6 +115,8 @@ async function getPriceViaSearch(wid, mode, token) {
   }
 
   const r = await fetchJson(url, headers);
+  dbg.search.push({ mode, url, status: r.status, ok: r.ok, reqId: r.reqId, ct: r.ct });
+
   if (!r.ok) return { ok:false, status:r.status, url, ct:r.ct, reqId:r.reqId, where:"search" };
 
   const results = Array.isArray(r.data?.results) ? r.data.results : [];
@@ -142,7 +147,6 @@ function parsePriceFromHtml(html) {
     const raw = m[1];
     try {
       const data = JSON.parse(raw);
-      // data pode ser objeto ou array
       const nodes = Array.isArray(data) ? data : [data];
       for (const node of nodes) {
         const offers = node?.offers;
@@ -168,8 +172,7 @@ function parsePriceFromHtml(html) {
   return null;
 }
 
-async function scrapePrice(wid) {
-  // tentamos duas URLs comuns de item
+async function scrapePrice(wid, dbg) {
   const urls = [
     `https://produto.mercadolivre.com.br/${wid}`,
     `https://www.mercadolivre.com.br/${wid}`
@@ -177,19 +180,26 @@ async function scrapePrice(wid) {
   for (const url of urls) {
     try {
       const r = await fetch(url, { headers: HTML_HEADERS, redirect: "follow" });
-      if (!r.ok) continue;
-      const html = await r.text();
-      const price = parsePriceFromHtml(html);
-      if (price && price > 0) {
+      const status = r.status;
+      const ok = r.ok;
+      let price = null;
+      if (ok) {
+        const html = await r.text();
+        price = parsePriceFromHtml(html);
+      }
+      dbg.scrape.push({ url, status, ok, price });
+      if (ok && price && price > 0) {
         return { ok:true, price, url };
       }
-    } catch {}
+    } catch (e) {
+      dbg.scrape.push({ url, error: String(e && e.message || e) });
+    }
   }
   return { ok:false };
 }
 
 // ---------- Core: obter preço por WID ----------
-async function getPriceByWID(wid, token) {
+async function getPriceByWID(wid, token, dbg) {
   const ATTRS = "price,status,available_quantity,sold_quantity,permalink";
 
   // 1) COM TOKEN no header (se houver)
@@ -221,6 +231,8 @@ async function getPriceByWID(wid, token) {
   for (const seq of sequences) {
     for (const t of seq) {
       const r = await fetchJson(t.url, t.headers);
+      dbg.items.push({ kind: t.kind, url: t.url, status: r.status, ok: r.ok, reqId: r.reqId, ct: r.ct });
+
       if (!r.ok) continue;
 
       if (t.bulk) {
@@ -255,15 +267,15 @@ async function getPriceByWID(wid, token) {
   // 4) BUSCA: token header → token na query → público
   const searchModes = token ? ["auth_header", "auth_query", "public"] : ["public"];
   for (const m of searchModes) {
-    const sr = await getPriceViaSearch(wid, m, token);
+    const sr = await getPriceViaSearch(wid, m, token, dbg);
     if (sr.ok) {
       return { ok:true, price: sr.price, item_id: wid, sold_winner: null, via: sr.where };
     }
   }
 
-  // 5) SCRAPE (se autorizado via env)
-  if (String(process.env.ENABLE_SCRAPE_FALLBACK || "") === "1") {
-    const scr = await scrapePrice(wid);
+  // 5) SCRAPE (se habilitado)
+  if (dbg.enableScrape) {
+    const scr = await scrapePrice(wid, dbg);
     if (scr.ok) {
       return { ok:true, price: scr.price, item_id: wid, sold_winner: null, via: "scrape" };
     }
@@ -274,7 +286,7 @@ async function getPriceByWID(wid, token) {
     ok: false,
     status: 401,
     error_code: "UPSTREAM_ERROR",
-    message: "Falha ao obter preço do WID (itens, busca e scrape desativado).",
+    message: "Falha ao obter preço do WID (itens, busca e scrape).",
     details: { phase: "all-fallbacks-exhausted" }
   };
 }
@@ -295,6 +307,9 @@ export default async function handler(req, res) {
     // Apenas WID — use ?wid= (compat: ?product_id=)
     const q   = req.query || {};
     const wid = String(q.wid || q.product_id || "").trim().toUpperCase();
+    const debug = String(q.debug || "") === "1";
+    const forceScrape = String(q.sf || q.scrape || "") === "1";
+    const enableScrape = forceScrape || String(process.env.ENABLE_SCRAPE_FALLBACK || "") === "1";
 
     if (!isWID(wid)) {
       return sendJSON(res, 200, {
@@ -306,19 +321,30 @@ export default async function handler(req, res) {
     }
 
     const token = await getTokenMaybe(); // pode ser null
-    const out   = await getPriceByWID(wid, token);
+    const dbg = {
+      vercelRegion: process.env.VERCEL_REGION || null,
+      tokenPresent: !!token,
+      enableScrape,
+      items: [],
+      search: [],
+      scrape: []
+    };
+
+    const out = await getPriceByWID(wid, token, dbg);
 
     if (!out.ok) {
-      return sendJSON(res, 200, {
+      const err = {
         ok:false,
         error_code: out.error_code || "UPSTREAM_ERROR",
         message: out.message || "Falha ao consultar WID",
         http_status: out.status || 500,
         details: out.details || {}
-      });
+      };
+      if (debug) err._debug = dbg;
+      return sendJSON(res, 200, err);
     }
 
-    return sendJSON(res, 200, {
+    const resp = {
       ok: true,
       price: out.price,
       source: "item",
@@ -326,7 +352,9 @@ export default async function handler(req, res) {
       item_id: out.item_id,
       sold_winner: out.sold_winner,
       fetched_at: nowISO()
-    });
+    };
+    if (debug) resp._debug = dbg;
+    return sendJSON(res, 200, resp);
 
   } catch (e) {
     return sendJSON(res, 200, {
