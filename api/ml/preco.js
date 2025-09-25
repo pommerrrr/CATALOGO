@@ -1,6 +1,6 @@
-// api/ml/preco.js (FINAL)
-// Sempre responde JSON. Busca Buy Box com token; se falhar, cai em ofertas de catálogo.
-// Também retorna contadores de vendidos (winner ou soma de ofertas).
+// api/ml/preco.js (FINAL atualizado)
+// Busca Buy Box (com token) e, se não houver, cai no fallback de ofertas do catálogo.
+// Agora o fallback também envia Authorization quando o token existe.
 
 function buildHeaders(token) {
   const h = { Accept: 'application/json', 'User-Agent': 'ImportCostControl/1.0 (server)' };
@@ -36,7 +36,7 @@ export default async function handler(req, res) {
       }));
     }
 
-    // Import do token (JS)
+    // Import do token (JS) – extensão .js é obrigatória em ESM na Vercel
     let token = null, tokenErr = null;
     try {
       const mod = await import('./token.js');
@@ -66,7 +66,7 @@ async function getProductInfo(mlId, token) {
   const isCatalog = mlId.replace('MLB','').length < 10;
 
   if (isCatalog) {
-    // Tenta Buy Box (precisa token)
+    // 1) Tenta Buy Box (precisa token)
     if (token) {
       try {
         const r = await fetch(`${base}/products/${mlId}`, { headers: buildHeaders(token) });
@@ -107,8 +107,9 @@ async function getProductInfo(mlId, token) {
         // ignora e cai no fallback
       }
     }
-    // Fallback: ofertas (não precisa token)
-    return getCatalogOffers(mlId, base, fetched_at);
+
+    // 2) Fallback: ofertas do catálogo (agora com token quando existir)
+    return getCatalogOffers(mlId, base, fetched_at, token);
   }
 
   // ID de item direto
@@ -144,25 +145,40 @@ async function getProductInfo(mlId, token) {
   }
 }
 
-async function getCatalogOffers(mlId, base, fetched_at) {
+async function getCatalogOffers(mlId, base, fetched_at, token) {
   try {
     const url = `${base}/sites/MLB/search?product_id=${mlId}&limit=50&sort=price_asc`;
-    const r = await fetch(url, { headers: buildHeaders() });
+    const r = await fetch(url, { headers: buildHeaders(token || undefined) });
     const ct = r.headers.get('content-type') || '';
+
     if (!r.ok) {
+      if (r.status === 401) {
+        return {
+          ok:false,
+          error_code:'AUTH_REQUIRED',
+          message:'Mercado Livre retornou 401 para a busca de ofertas. Verifique se o app está autorizado e se o token possui escopo de leitura.',
+          http_status:401,
+          details:{ upstream_url:url }
+        };
+      }
       return { ok:false, error_code:'SEARCH_ERROR', message:`Error ${r.status} on offers`, http_status:r.status, details:{ upstream_url:url } };
     }
+
     if (!ct.includes('application/json')) {
       return { ok:false, error_code:'UPSTREAM_JSON', message:'Invalid response (not JSON) on offers', http_status:502, details:{ upstream_url:url } };
     }
+
     const data = await r.json();
     const results = Array.isArray(data?.results) ? data.results : [];
     const active = results.filter(o => (o.status === 'active' || !o.status) && o.price > 0);
+
     if (active.length === 0) {
       return { ok:false, error_code:'NO_ACTIVE_OFFERS', message:'Catalog found, but no active offers', http_status:404, details:{ upstream_url:url, total_results:results.length } };
     }
+
     const best = active[0];
     const soldTotal = active.reduce((s, o) => s + (typeof o.sold_quantity === 'number' ? o.sold_quantity : 0), 0);
+
     return {
       ok: true,
       price: best.price,
