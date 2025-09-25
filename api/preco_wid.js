@@ -1,11 +1,12 @@
-// api/ml/preco_wid.js
-// WID-only (MLB do anúncio) 100% público, sem Authorization.
-// Aceita:
+// api/preco_wid.js
+// WID-only (MLB do anúncio) 100% público (sem Authorization) — retorna SEMPRE JSON.
+// Entradas aceitas:
 //   - ?product_id=MLBxxxxxxxxxx
-//   - ?product_id=<link-de-catálogo-com-#...wid=MLBxxxxxxxxxx>
+//   - ?product_id=<link de catálogo com #...wid=MLBxxxxxxxxxx>
 //   - ?my_item_id=MLBxxxxxxxxxx
 //
-// Fluxo: /items/{id} (público) → se falhar, /items?ids={id} (público).
+// Fluxo: /items/{id} → se falhar, /items?ids={id} (ambos públicos).
+// Nunca tenta buy box/catálogo; evita 403 quando o item não é seu.
 
 const ML_BASE = "https://api.mercadolibre.com";
 
@@ -14,9 +15,7 @@ function send(res, code, body) {
   res.setHeader("Content-Type", "application/json");
   res.end(JSON.stringify(body));
 }
-
-function isWID(s) { return !!s && /^MLB\d{10,}$/i.test(String(s).trim()); }
-
+const isWID = s => !!s && /^MLB\d{10,}$/i.test(String(s).trim());
 function widFromHash(url) {
   if (!url) return null;
   try {
@@ -25,11 +24,8 @@ function widFromHash(url) {
     return m ? m[1].toUpperCase() : null;
   } catch { return null; }
 }
-
 async function getJsonPublic(url) {
-  const r = await fetch(url, {
-    headers: { Accept: "application/json", "User-Agent": "WidOnly/1.0" }
-  });
+  const r = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "WidOnly/1.0" } });
   const ct = r.headers.get("content-type") || "";
   let data = null;
   if (ct.includes("application/json")) {
@@ -37,12 +33,10 @@ async function getJsonPublic(url) {
   }
   return { ok: r.ok, status: r.status, data, url };
 }
-
 async function getItemDirect(wid) {
   const url = `${ML_BASE}/items/${wid}?attributes=price,status,available_quantity,sold_quantity,permalink`;
   return getJsonPublic(url);
 }
-
 async function getItemBulk(wid) {
   const url = `${ML_BASE}/items?ids=${wid}&attributes=price,status,available_quantity,sold_quantity,permalink`;
   const r = await getJsonPublic(url);
@@ -57,23 +51,20 @@ async function getItemBulk(wid) {
 
 export default async function handler(req, res) {
   try {
-    // CORS
+    // CORS + nunca retornar HTML
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     res.setHeader("Cache-Control", "no-store");
-    if (req.method === "OPTIONS") return send(res, 200, { ok: true });
-
-    if (req.method !== "GET") {
-      return send(res, 200, { ok:false, error_code:"METHOD_NOT_ALLOWED", http_status:405 });
-    }
+    if (req.method === "OPTIONS") return send(res, 200, { ok: true, version: "wid_only_public_flat" });
+    if (req.method !== "GET") return send(res, 200, { ok:false, error_code:"METHOD_NOT_ALLOWED", http_status:405, version:"wid_only_public_flat" });
 
     const q = req.query || {};
     let productInput = String(q.product_id || "").trim();
     const myItemId = String(q.my_item_id || "").trim();
     const debug = String(q.debug || "") === "1";
 
-    // Resolver WID
+    // Resolver WID (prioridade total)
     let wid = null;
     if (isWID(myItemId)) wid = myItemId.toUpperCase();
     if (!wid && isWID(productInput)) wid = productInput.toUpperCase();
@@ -81,14 +72,12 @@ export default async function handler(req, res) {
       const fromHash = widFromHash(productInput);
       if (isWID(fromHash)) wid = fromHash.toUpperCase();
     }
-
     if (!isWID(wid)) {
       return send(res, 200, {
         ok:false,
         error_code:"MISSING_WID",
-        message:"Informe o WID (MLB do anúncio) ou cole o link do catálogo com #...wid=MLB...",
-        http_status:400,
-        version:"wid_only_public_v1",
+        message:"Informe o WID (MLB do anúncio) ou cole o link de catálogo com #...wid=MLB...",
+        http_status:400, version:"wid_only_public_flat",
         _debug: debug ? { productInput, myItemId } : undefined
       });
     }
@@ -96,16 +85,14 @@ export default async function handler(req, res) {
     // 1) /items/{id}
     let r = await getItemDirect(wid);
     if (!r.ok) {
-      // 2) fallback /items?ids=
+      // 2) /items?ids=
       const rb = await getItemBulk(wid);
       if (!rb.ok) {
         return send(res, 200, {
-          ok:false,
-          error_code:"UPSTREAM_ERROR",
+          ok:false, error_code:"UPSTREAM_ERROR",
           message:`Erro ${rb.status} em ${rb.url.includes("?ids=")?"/items?ids":"/items/{id}"}`,
-          http_status: rb.status,
-          details:{ upstream_url: rb.url },
-          version:"wid_only_public_v1",
+          http_status: rb.status, details:{ upstream_url: rb.url },
+          version:"wid_only_public_flat",
           _debug: debug ? { direct_status: r.status } : undefined
         });
       }
@@ -117,7 +104,7 @@ export default async function handler(req, res) {
     if (!price) {
       return send(res, 200, {
         ok:false, error_code:"NO_PRICE", message:"Anúncio sem preço disponível",
-        http_status:404, details:{ upstream_url: r.url }, version:"wid_only_public_v1",
+        http_status:404, details:{ upstream_url: r.url }, version:"wid_only_public_flat",
         _debug: debug ? { body } : undefined
       });
     }
@@ -131,10 +118,11 @@ export default async function handler(req, res) {
       sold_winner: Number.isFinite(body?.sold_quantity) ? body.sold_quantity : null,
       sold_catalog_total: null,
       fetched_at: new Date().toISOString(),
-      version:"wid_only_public_v1",
+      version:"wid_only_public_flat",
       _debug: debug ? { via: r.url.includes("?ids=") ? "bulk" : "direct" } : undefined
     });
+
   } catch (e) {
-    return send(res, 200, { ok:false, error_code:"INTERNAL", http_status:500, message:String(e?.message||e), version:"wid_only_public_v1" });
+    return send(res, 200, { ok:false, error_code:"INTERNAL", http_status:500, message:String(e?.message||e), version:"wid_only_public_flat" });
   }
 }
