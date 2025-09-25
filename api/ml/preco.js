@@ -1,11 +1,21 @@
-// api/ml/preco.js (FINAL atualizado)
-// Busca Buy Box (com token) e, se não houver, cai no fallback de ofertas do catálogo.
-// Agora o fallback também envia Authorization quando o token existe.
+// api/ml/preco.js (FINAL – sem /sites/MLB/search)
+// Fluxo:
+// 1) Catálogo: tenta Buy Box via /products/{id} (com token).
+// 2) Sem Buy Box: lista itens via /products/{id}/items (com token) e
+//    busca detalhes em lotes com /items?ids=...  → menor preço + soma de vendidos.
+// 3) ID de item: consulta /items/{id}.
+// Sempre responde JSON e nunca redireciona.
 
 function buildHeaders(token) {
   const h = { Accept: 'application/json', 'User-Agent': 'ImportCostControl/1.0 (server)' };
   if (token) h.Authorization = `Bearer ${token}`;
   return h;
+}
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
 }
 
 export default async function handler(req, res) {
@@ -36,7 +46,7 @@ export default async function handler(req, res) {
       }));
     }
 
-    // Import do token (JS) – extensão .js é obrigatória em ESM na Vercel
+    // Import do token (arquivo JS; extensão .js é obrigatória em ESM)
     let token = null, tokenErr = null;
     try {
       const mod = await import('./token.js');
@@ -66,50 +76,73 @@ async function getProductInfo(mlId, token) {
   const isCatalog = mlId.replace('MLB','').length < 10;
 
   if (isCatalog) {
-    // 1) Tenta Buy Box (precisa token)
-    if (token) {
-      try {
-        const r = await fetch(`${base}/products/${mlId}`, { headers: buildHeaders(token) });
-        const ct = r.headers.get('content-type') || '';
-        if (r.ok && ct.includes('application/json')) {
-          const data = await r.json();
-          if (data?.buy_box_winner?.price) {
-            const price = data.buy_box_winner.price;
-            const itemId = data.buy_box_winner.item_id || null;
-
-            // vendidos do item vencedor (melhor esforço)
-            let soldWinner = null;
-            if (itemId) {
-              try {
-                const ri = await fetch(`${base}/items/${itemId}`, { headers: buildHeaders(token) });
-                const cti = ri.headers.get('content-type') || '';
-                if (ri.ok && cti.includes('application/json')) {
-                  const ji = await ri.json();
-                  soldWinner = typeof ji.sold_quantity === 'number' ? ji.sold_quantity : null;
-                }
-              } catch {}
-            }
-
-            return {
-              ok: true,
-              price,
-              source: 'buy_box',
-              product_id: mlId,
-              item_id: itemId,
-              sold_winner: soldWinner,
-              sold_catalog_total: null,
-              fetched_at
-            };
-          }
-        }
-        // Se não ok/JSON/sem buy box → fallback
-      } catch {
-        // ignora e cai no fallback
-      }
+    if (!token) {
+      return {
+        ok:false,
+        error_code:'AUTH_REQUIRED',
+        message:'Token ausente para consultar catálogo.',
+        http_status:401
+      };
     }
 
-    // 2) Fallback: ofertas do catálogo (agora com token quando existir)
-    return getCatalogOffers(mlId, base, fetched_at, token);
+    // 1) Tenta Buy Box
+    try {
+      const r = await fetch(`${base}/products/${mlId}`, { headers: buildHeaders(token) });
+      const ct = r.headers.get('content-type') || '';
+      if (r.ok && ct.includes('application/json')) {
+        const data = await r.json();
+        if (data?.buy_box_winner?.price) {
+          const price = data.buy_box_winner.price;
+          const itemId = data.buy_box_winner.item_id || null;
+
+          // Vendidos do item vencedor (melhor esforço)
+          let soldWinner = null;
+          if (itemId) {
+            try {
+              const ri = await fetch(`${base}/items/${itemId}`, { headers: buildHeaders(token) });
+              const cti = ri.headers.get('content-type') || '';
+              if (ri.ok && cti.includes('application/json')) {
+                const ji = await ri.json();
+                soldWinner = typeof ji.sold_quantity === 'number' ? ji.sold_quantity : null;
+              }
+            } catch {}
+          }
+
+          return {
+            ok: true,
+            price,
+            source: 'buy_box',
+            product_id: mlId,
+            item_id: itemId,
+            sold_winner: soldWinner,
+            sold_catalog_total: null,
+            fetched_at
+          };
+        }
+      } else if (r.status === 401) {
+        return {
+          ok:false,
+          error_code:'AUTH_REQUIRED',
+          message:'401 em /products/{id}. Reautorize o app e confira os escopos.',
+          http_status:401,
+          details:{ upstream_url: `${base}/products/${mlId}`, upstream_status: r.status }
+        };
+      } else if (r.status === 403) {
+        return {
+          ok:false,
+          error_code:'FORBIDDEN',
+          message:'403 em /products/{id}. Permissões insuficientes.',
+          http_status:403,
+          details:{ upstream_url: `${base}/products/${mlId}`, upstream_status: r.status }
+        };
+      }
+      // Sem Buy Box → fallback autenticado
+    } catch {
+      // segue para o fallback
+    }
+
+    // 2) Fallback autenticado: listar itens do catálogo e pegar menor preço
+    return getCatalogItemsAndPickBest(mlId, base, token, fetched_at);
   }
 
   // ID de item direto
@@ -121,75 +154,4 @@ async function getProductInfo(mlId, token) {
       if (r.status === 404) {
         return { ok:false, error_code:'ITEM_NOT_FOUND', message:'Item not found', http_status:404, details:{ upstream_url:itemUrl } };
       }
-      return { ok:false, error_code:'UPSTREAM_ERROR', message:`Error ${r.status} on item`, http_status:r.status, details:{ upstream_url:itemUrl } };
-    }
-    if (!ct.includes('application/json')) {
-      return { ok:false, error_code:'UPSTREAM_JSON', message:'Invalid response (not JSON) on item', http_status:502, details:{ upstream_url:itemUrl } };
-    }
-    const data = await r.json();
-    if (!(data?.price > 0)) {
-      return { ok:false, error_code:'NO_PRICE', message:'Item has no price', http_status:404, details:{ upstream_url:itemUrl } };
-    }
-    return {
-      ok: true,
-      price: data.price,
-      source: 'item',
-      product_id: mlId,
-      item_id: mlId,
-      sold_winner: typeof data.sold_quantity === 'number' ? data.sold_quantity : null,
-      sold_catalog_total: null,
-      fetched_at
-    };
-  } catch (e) {
-    return { ok:false, error_code:'ITEM_ERROR', message:'Error consulting item: ' + String(e?.message||e), http_status:500, details:{ upstream_url:itemUrl } };
-  }
-}
-
-async function getCatalogOffers(mlId, base, fetched_at, token) {
-  try {
-    const url = `${base}/sites/MLB/search?product_id=${mlId}&limit=50&sort=price_asc`;
-    const r = await fetch(url, { headers: buildHeaders(token || undefined) });
-    const ct = r.headers.get('content-type') || '';
-
-    if (!r.ok) {
-      if (r.status === 401) {
-        return {
-          ok:false,
-          error_code:'AUTH_REQUIRED',
-          message:'Mercado Livre retornou 401 para a busca de ofertas. Verifique se o app está autorizado e se o token possui escopo de leitura.',
-          http_status:401,
-          details:{ upstream_url:url }
-        };
-      }
-      return { ok:false, error_code:'SEARCH_ERROR', message:`Error ${r.status} on offers`, http_status:r.status, details:{ upstream_url:url } };
-    }
-
-    if (!ct.includes('application/json')) {
-      return { ok:false, error_code:'UPSTREAM_JSON', message:'Invalid response (not JSON) on offers', http_status:502, details:{ upstream_url:url } };
-    }
-
-    const data = await r.json();
-    const results = Array.isArray(data?.results) ? data.results : [];
-    const active = results.filter(o => (o.status === 'active' || !o.status) && o.price > 0);
-
-    if (active.length === 0) {
-      return { ok:false, error_code:'NO_ACTIVE_OFFERS', message:'Catalog found, but no active offers', http_status:404, details:{ upstream_url:url, total_results:results.length } };
-    }
-
-    const best = active[0];
-    const soldTotal = active.reduce((s, o) => s + (typeof o.sold_quantity === 'number' ? o.sold_quantity : 0), 0);
-
-    return {
-      ok: true,
-      price: best.price,
-      source: 'catalog_offers',
-      product_id: mlId,
-      item_id: best.id,
-      sold_winner: null,
-      sold_catalog_total: soldTotal,
-      fetched_at
-    };
-  } catch (e) {
-    return { ok:false, error_code:'OFFERS_ERROR', message:'Error searching offers: ' + String(e?.message||e), http_status:500 };
-  }
-}
+      return { ok:false, error_code:'UPSTREAM_ERROR', message:`Error ${r.status} on item`, http_status:r.status, d_
