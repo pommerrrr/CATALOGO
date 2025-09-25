@@ -1,18 +1,23 @@
 // api/ml/preco.js
-// === WID-ONLY (MLB com 10+ dígitos) ===
+// === SOMENTE WID (MLB com 10+ dígitos) ===
 // Uso:  GET /api/ml/preco?wid=MLB1234567890   (compat: ?product_id=MLB...)
-// Retorna SEMPRE JSON com o preço do ANÚNCIO (não usa catálogo/buy box).
-// Estratégia antifalha para WIDs que não são seus:
-//  1) Tenta COM TOKEN (Authorization) em /items (direto e bulk), com e sem attributes
-//  2) Tenta COM TOKEN na QUERY (?access_token=...) nas mesmas URLs
-//  3) Tenta PÚBLICO (sem token) com cabeçalhos de navegador
-//  4) Fallback BUSCA pública: /sites/MLB/search?q=WID (token → token na query → público)
-// Em falha, devolve erro estruturado com status, URL e alguns headers úteis.
+// Retorna SEMPRE JSON com o preço do ANÚNCIO.
+// Ordem de tentativas:
+//  1) COM TOKEN no header  → /items (direto/bulk, com/sem attributes)
+//  2) COM TOKEN na query   → /items (direto/bulk, com/sem attributes)
+//  3) PÚBLICO (sem token)  → /items (direto/bulk, com/sem attributes)
+//  4) BUSCA pública        → /sites/MLB/search?q=WID (com token → token na query → público)
+//  5) (Opcional) SCRAPE HTML da página do anúncio (se ENABLE_SCRAPE_FALLBACK=1)
+//
+// Observações:
+// - Muitos ambientes passaram a exigir token inclusive em endpoints antes "públicos".
+// - Se ainda assim falhar com WIDs de terceiros, ative o scrape fallback e/ou fixe a região GRU1.
 
 const ML_BASE = "https://api.mercadolibre.com";
 
 // ---------- Utils ----------
 const isWID = (s) => !!s && /^MLB\d{10,}$/i.test(String(s).trim());
+const nowISO = () => new Date().toISOString();
 
 function sendJSON(res, code, body) {
   res.statusCode = code;
@@ -49,7 +54,6 @@ const PUBLIC_HEADERS = {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
     "(KHTML, like Gecko) Chrome/125.0 Safari/537.36",
   "Cache-Control": "no-cache"
-  // intencionalmente sem Origin/Referer
 };
 
 function authHeaders(token) {
@@ -59,7 +63,6 @@ function authHeaders(token) {
     "Cache-Control": "no-cache",
     Authorization: `Bearer ${token}`
   };
-  // opcional: identificar integrador se disponível
   if (process.env.ML_INTEGRATOR_ID) {
     h["x-integrator-id"] = String(process.env.ML_INTEGRATOR_ID);
   }
@@ -74,7 +77,10 @@ async function fetchJson(url, headers) {
   if (ct.includes("application/json")) {
     try { data = await r.json(); } catch {}
   } else {
-    try { data = { _text: await r.text() }; } catch {}
+    try {
+      const txt = await r.text();
+      data = { _text: txt.slice(0, 2000) }; // limita para debug
+    } catch {}
   }
   return { ok: r.ok, status: r.status, data, url, ct, reqId };
 }
@@ -97,7 +103,6 @@ function extractPriceSold(body) {
 
 // ---------- BUSCA pública de fallback ----------
 async function getPriceViaSearch(wid, mode, token) {
-  // mode: "auth_header" | "auth_query" | "public"
   let url = `${ML_BASE}/sites/MLB/search?q=${encodeURIComponent(wid)}&limit=3`;
   let headers = PUBLIC_HEADERS;
   if (mode === "auth_header" && token) {
@@ -117,8 +122,70 @@ async function getPriceViaSearch(wid, mode, token) {
   if (!hit) return { ok:false, status:404, url, ct:r.ct, reqId:r.reqId, where:"search_no_hit" };
 
   const price = Number(hit.price || 0);
-  if (price > 0) return { ok:true, price, where:"search", url };
+  if (price > 0) return { ok:true, price, where:"search" };
   return { ok:false, status:404, url, ct:r.ct, reqId:r.reqId, where:"search_no_price" };
+}
+
+// ---------- SCRAPE (opcional, último recurso) ----------
+const HTML_HEADERS = {
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+};
+
+function parsePriceFromHtml(html) {
+  // tenta achar JSON-LD com offers.price
+  const scripts = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const m of scripts) {
+    const raw = m[1];
+    try {
+      const data = JSON.parse(raw);
+      // data pode ser objeto ou array
+      const nodes = Array.isArray(data) ? data : [data];
+      for (const node of nodes) {
+        const offers = node?.offers;
+        if (!offers) continue;
+        if (Array.isArray(offers)) {
+          for (const off of offers) {
+            const p = Number(off?.price || 0);
+            if (p > 0) return p;
+          }
+        } else if (typeof offers === "object") {
+          const p = Number(offers?.price || 0);
+          if (p > 0) return p;
+        }
+      }
+    } catch {}
+  }
+  // fallback: regex simples (menos confiável)
+  const mPrice = html.match(/"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)/i);
+  if (mPrice) {
+    const p = Number(mPrice[1]);
+    if (p > 0) return p;
+  }
+  return null;
+}
+
+async function scrapePrice(wid) {
+  // tentamos duas URLs comuns de item
+  const urls = [
+    `https://produto.mercadolivre.com.br/${wid}`,
+    `https://www.mercadolivre.com.br/${wid}`
+  ];
+  for (const url of urls) {
+    try {
+      const r = await fetch(url, { headers: HTML_HEADERS, redirect: "follow" });
+      if (!r.ok) continue;
+      const html = await r.text();
+      const price = parsePriceFromHtml(html);
+      if (price && price > 0) {
+        return { ok:true, price, url };
+      }
+    } catch {}
+  }
+  return { ok:false };
 }
 
 // ---------- Core: obter preço por WID ----------
@@ -194,12 +261,20 @@ async function getPriceByWID(wid, token) {
     }
   }
 
+  // 5) SCRAPE (se autorizado via env)
+  if (String(process.env.ENABLE_SCRAPE_FALLBACK || "") === "1") {
+    const scr = await scrapePrice(wid);
+    if (scr.ok) {
+      return { ok:true, price: scr.price, item_id: wid, sold_winner: null, via: "scrape" };
+    }
+  }
+
   // Falha geral
   return {
     ok: false,
     status: 401,
     error_code: "UPSTREAM_ERROR",
-    message: "Falha ao obter preço do WID (itens e busca).",
+    message: "Falha ao obter preço do WID (itens, busca e scrape desativado).",
     details: { phase: "all-fallbacks-exhausted" }
   };
 }
@@ -250,7 +325,7 @@ export default async function handler(req, res) {
       product_id: wid,
       item_id: out.item_id,
       sold_winner: out.sold_winner,
-      fetched_at: new Date().toISOString()
+      fetched_at: nowISO()
     });
 
   } catch (e) {
