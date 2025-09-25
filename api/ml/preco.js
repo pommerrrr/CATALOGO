@@ -1,7 +1,7 @@
 // api/ml/preco.js
-// WID-only: GET /api/ml/preco?wid=MLB1234567890 (&debug=1 [&sf=1])
-// Ordem: token header → token query → público → busca → (opcional) scrape
-// Extratores ampliados + debug de bulk + scrape via permalink (se disponível).
+// WID-only: GET /api/ml/preco?wid=MLB1234567890 (&debug=1 [&sf=1] [&bulk_body=1])
+// Ordem: token header → token query → público (com Referer/Origin) → busca → (opcional) scrape
+// Extras: bulkProbe + bulkBodySample (debug) + scraper via permalink.
 
 const ML_BASE = "https://api.mercadolibre.com";
 
@@ -33,12 +33,15 @@ function addAccessToken(url, token) {
   return url + (url.includes("?") ? "&" : "?") + "access_token=" + encodeURIComponent(token);
 }
 
+// ---------- HTTP helpers ----------
 const PUBLIC_HEADERS = {
   Accept: "application/json",
   "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
-  "Cache-Control": "no-cache"
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
+  "Cache-Control": "no-cache",
+  // Alguns endpoints “públicos” do ML validam origem/referrer
+  Origin: "https://www.mercadolivre.com.br",
+  Referer: "https://www.mercadolivre.com.br/"
 };
 function authHeaders(token) {
   const h = {
@@ -52,7 +55,7 @@ function authHeaders(token) {
 }
 
 async function fetchJson(url, headers) {
-  const r = await fetch(url, { headers });
+  const r = await fetch(url, { headers, redirect: "follow" });
   const ct = r.headers.get("content-type") || "";
   const reqId = r.headers.get("x-request-id")
     || r.headers.get("x-request-id-meli")
@@ -75,12 +78,12 @@ function normalizeBulk(r) {
   const arr = Array.isArray(r.data) ? r.data : [];
   const first = arr[0] || {};
   if (first.code === 200 && first.body) {
-    return { ok: true, data: first.body, status: 200, url: r.url, ct: r.ct, reqId: r.reqId };
+    return { ok: true, data: first.body, status: 200, url: r.url, ct: r.ct, reqId: r.reqId, raw: first };
   }
   return { ok: false, status: first.code || r.status || 404, url: r.url, ct: r.ct, reqId: r.reqId, raw: first };
 }
 
-// --------- Extractors ----------
+// ---------- Extractors ----------
 function numOrZero(v) {
   if (typeof v === "number") return v;
   if (v && typeof v === "object" && typeof v.amount === "number") return v.amount;
@@ -98,7 +101,6 @@ function extractFromPricesObject(pricesObj) {
 }
 function extractFromVariations(variations) {
   if (!Array.isArray(variations) || !variations.length) return null;
-  // pega menor preço > 0 a partir de variation.price (número ou objeto) ou variation.prices[].amount
   const vals = [];
   for (const v of variations) {
     const pv = numOrZero(v?.price);
@@ -113,7 +115,6 @@ function extractFromVariations(variations) {
   return Math.min(...vals);
 }
 function extractPriceSold(body) {
-  // 1) diretos
   let price =
     numOrZero(body?.price) ||
     numOrZero(body?.base_price) ||
@@ -122,21 +123,19 @@ function extractPriceSold(body) {
   let sold  = Number.isFinite(body?.sold_quantity) ? body.sold_quantity : null;
   if (price > 0) return { price, sold };
 
-  // 2) prices.prices
   const fromPrices = extractFromPricesObject(body?.prices);
   if (Number(fromPrices) > 0) return { price: Number(fromPrices), sold };
 
-  // 3) variations (inclusive variation.prices[].amount)
   const fromVars = extractFromVariations(body?.variations);
   if (Number(fromVars) > 0) return { price: Number(fromVars), sold };
 
   return { price: 0, sold };
 }
 
-// --------- Search fallback ----------
+// ---------- Search fallback ----------
 async function getPriceViaSearch(wid, mode, token, dbg) {
   let url = `${ML_BASE}/sites/MLB/search?q=${encodeURIComponent(wid)}&limit=3`;
-  let headers = PUBLIC_HEADERS;
+  let headers = { ...PUBLIC_HEADERS, Referer: `https://www.mercadolivre.com.br/MLB${wid.replace(/^MLB/i, "")}` };
   if (mode === "auth_header" && token) headers = authHeaders(token);
   else if (mode === "auth_query" && token) url = addAccessToken(url, token);
 
@@ -155,12 +154,13 @@ async function getPriceViaSearch(wid, mode, token, dbg) {
   return { ok:false, status:404, url, ct:r.ct, reqId:r.reqId, where:"search_no_price" };
 }
 
-// --------- Scrape ----------
+// ---------- Scrape ----------
 const HTML_HEADERS = {
   Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
+  Referer: "https://www.mercadolivre.com.br/",
+  Origin: "https://www.mercadolivre.com.br"
 };
 function safeJsonParse(s) { try { return JSON.parse(s); } catch { return null; } }
 function parseBRL(str) {
@@ -174,7 +174,6 @@ function findPriceInObject(obj) {
     if (!node || typeof node !== "object") return;
     if (typeof node.amount === "number" && node.amount > 0) {
       const p = path.join(".").toLowerCase();
-      // priorizar chaves relacionadas a preço/buybox
       if (p.includes("price") || p.includes("unitprice") || p.includes("unit_price") || p.includes("buybox")) {
         best = best ? Math.max(best, node.amount) : node.amount;
       } else if (best == null) {
@@ -224,7 +223,16 @@ function parsePriceFromHtml(html) {
     const obj = safeJsonParse(mNext[1]); const f = obj ? findPriceInObject(obj) : null;
     if (Number(f) > 0) return Number(f);
   }
-  // Selectors comuns
+  // Meta tags comuns
+  const mMetaPrice = html.match(/<meta[^>]+itemprop=["']price["'][^>]+content=["']([\d\.]+)["']/i);
+  if (mMetaPrice) {
+    const p = Number(mMetaPrice[1]); if (p > 0) return p;
+  }
+  const mOgPrice = html.match(/<meta[^>]+property=["']og:price:amount["'][^>]+content=["']([\d\.]+)["']/i);
+  if (mOgPrice) {
+    const p = Number(mOgPrice[1]); if (p > 0) return p;
+  }
+  // Selectors estáticos
   const mFraction = html.match(/andes-money-amount__fraction[^>]*>([\d\.]+)/i);
   if (mFraction) {
     let frac = mFraction[1].replace(/\./g, "");
@@ -235,7 +243,7 @@ function parsePriceFromHtml(html) {
   if (mTestId) {
     const p = parseBRL(mTestId[1]); if (p && p > 0) return p;
   }
-  // BRL genérico (pega maior valor plausível para evitar parcela)
+  // BRL genérico
   const money = [...html.matchAll(/R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*,\d{2})/g)]
     .map(m => parseBRL(m[1]))
     .filter(n => typeof n === "number" && n > 0 && n < 1000000);
@@ -274,8 +282,36 @@ async function scrapePrice(wid, permalink, dbg) {
   return { ok:false };
 }
 
-// --------- Core ---------
-async function getPriceByWID(wid, token, dbg) {
+// ---------- Core ----------
+function summarizeKeys(obj, depth = 2) {
+  if (!obj || typeof obj !== "object" || depth < 0) return typeof obj;
+  const out = {};
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (v && typeof v === "object") {
+      out[k] = Array.isArray(v) ? `[array:${v.length}]` : summarizeKeys(v, depth - 1);
+    } else {
+      out[k] = typeof v;
+    }
+  }
+  return out;
+}
+function sampleJson(json, maxChars = 6000) {
+  try {
+    const s = JSON.stringify(json);
+    if (s.length <= maxChars) return json;
+    // corta mantendo início e fim
+    return {
+      _sample_begin: s.slice(0, Math.floor(maxChars * 0.6)),
+      _sample_end: s.slice(-Math.floor(maxChars * 0.35)),
+      _truncated: true
+    };
+  } catch {
+    return { _error: "cannot stringify" };
+  }
+}
+
+async function getPriceByWID(wid, token, dbg, wantBulkBody) {
   const ATTRS_FULL = [
     "price","base_price","original_price",
     "prices","variations",
@@ -314,12 +350,13 @@ async function getPriceByWID(wid, token, dbg) {
         const nb = normalizeBulk(r);
         if (!nb.ok) continue;
 
-        // --- bulkProbe SEMPRE que bulk==200 ---
+        // sempre coletar um probe do bulk quando 200
         if (!dbg.bulkProbe) {
           const pricesArr = Array.isArray(nb.data?.prices?.prices) ? nb.data.prices.prices : [];
           const varsArr   = Array.isArray(nb.data?.variations) ? nb.data.variations : [];
           dbg.bulkProbe = {
             from: t.kind,
+            topKeys: Object.keys(nb.data || {}),
             hasPrice: !!nb.data?.price,
             hasBasePrice: !!nb.data?.base_price,
             hasOriginalPrice: !!nb.data?.original_price,
@@ -327,6 +364,7 @@ async function getPriceByWID(wid, token, dbg) {
             variationsLen: varsArr.length,
             pricesLen: pricesArr.length,
             permalink: nb.data?.permalink || null,
+            keySummary: summarizeKeys(nb.data, 2),
             prices_sample: pricesArr.slice(0, 2).map(p => ({
               amount: (typeof p?.amount === "number" ? p.amount : (typeof p?.amount?.amount === "number" ? p.amount.amount : null)),
               currency_id: p?.currency_id ?? null,
@@ -338,11 +376,16 @@ async function getPriceByWID(wid, token, dbg) {
               id: v?.id ?? null,
               price: (typeof v?.price === "number" ? v.price : (typeof v?.price?.amount === "number" ? v.price.amount : null)),
               hasPricesArray: Array.isArray(v?.prices) && v.prices.length > 0,
-              firstPrice: (Array.isArray(v?.prices) && v.prices[0] ? (typeof v.prices[0].amount === "number" ? v.prices[0].amount : (typeof v.prices[0].amount?.amount === "number" ? v.prices[0].amount.amount : null)) : null)
+              firstPrice: (Array.isArray(v?.prices) && v.prices[0]
+                ? (typeof v.prices[0].amount === "number" ? v.prices[0].amount
+                   : (typeof v.prices[0].amount?.amount === "number" ? v.prices[0].amount.amount : null))
+                : null)
             }))
           };
+          if (wantBulkBody) {
+            dbg.bulkBodySample = sampleJson(nb.data);
+          }
         }
-        // --------------------------------------
 
         lastPermalink = nb.data?.permalink || lastPermalink;
 
@@ -363,7 +406,7 @@ async function getPriceByWID(wid, token, dbg) {
     }
   }
 
-  // Busca
+  // Busca (última chance antes do scrape)
   const searchModes = token ? ["auth_header", "auth_query", "public"] : ["public"];
   for (const m of searchModes) {
     const sr = await getPriceViaSearch(wid, m, token, dbg);
@@ -385,7 +428,7 @@ async function getPriceByWID(wid, token, dbg) {
   };
 }
 
-// --------- Handler ---------
+// ---------- Handler ----------
 export default async function handler(req, res) {
   try {
     res.setHeader("Content-Type", "application/json");
@@ -402,6 +445,7 @@ export default async function handler(req, res) {
     const debug = String(q.debug || "") === "1";
     const forceScrape = String(q.sf || q.scrape || "") === "1";
     const enableScrape = forceScrape || String(process.env.ENABLE_SCRAPE_FALLBACK || "") === "1";
+    const wantBulkBody = String(q.bulk_body || "") === "1";
 
     if (!isWID(wid)) {
       return sendJSON(res, 200, { ok:false, error_code:"MISSING_WID", message:"Envie wid=MLBxxxxxxxxxx (10+ dígitos).", http_status:400 });
@@ -418,7 +462,7 @@ export default async function handler(req, res) {
       bulkProbe: null
     };
 
-    const out = await getPriceByWID(wid, token, dbg);
+    const out = await getPriceByWID(wid, token, dbg, wantBulkBody);
 
     if (!out.ok) {
       const err = { ok:false, error_code: out.error_code || "UPSTREAM_ERROR", message: out.message || "Falha ao consultar WID", http_status: out.status || 500, details: out.details || {} };
