@@ -1,480 +1,252 @@
-// api/ml/preco.js
-// WID-only: GET /api/ml/preco?wid=MLB1234567890 (&debug=1 [&sf=1] [&bulk_body=1])
-// Ordem: token header → token query → público (com Referer/Origin) → busca → (opcional) scrape
-// Extras: bulkProbe + bulkBodySample (debug) + scraper via permalink.
+// api/ml/preco.ts
+// Uso: GET /api/ml/preco?product_id=MLBXXXXXXXXXX   (somente WID - Item ID)
+// Respostas (contrato):
+//  ok:true  -> { ok, price, source, product_id, item_id, fetched_at, ... }
+//  ok:false -> { ok:false, error_code, message, http_status, details? }
+//
+// Nova lógica: se o WID não é seu e a API do ML falhar (401/403/sem preço),
+// cai no fallback de SCRAPING usando Browserless (/content) e extrai o preço
+// da página pública do produto.
+//
+// Variáveis de ambiente esperadas:
+// - BROWSERLESS_BASE_URL (ex.: https://production-sfo.browserless.io)
+// - BROWSERLESS_TOKEN    (sua API key do Browserless)
+// - ML_ACCESS_TOKEN      (opcional; se você já gerencia token do ML aqui)
 
-const ML_BASE = "https://api.mercadolibre.com";
+type MLResp =
+  | { ok: true; price: number; source: "item" | "scrape"; product_id: string; item_id: string; fetched_at: string; sold_winner?: number | null; }
+  | { ok: false; error_code: string; message: string; http_status: number; details?: any };
 
-const isWID = (s) => !!s && /^MLB\d{10,}$/i.test(String(s).trim());
-const nowISO = () => new Date().toISOString();
+const JSON_HEADERS = { "Content-Type": "application/json" };
 
-function sendJSON(res, code, body) {
-  res.statusCode = code;
-  res.setHeader("Content-Type", "application/json");
+function send(res: any, code: number, body: any) {
+  res.status(code).setHeader("Content-Type", "application/json");
   res.end(JSON.stringify(body));
 }
 
-// token.js opcional
-async function getTokenMaybe() {
-  try {
-    const mod = await import("./token.js");
-    const fn =
-      (mod && typeof mod.getAccessToken === "function" && mod.getAccessToken) ||
-      (mod && typeof mod.default === "function" && mod.default) ||
-      null;
-    if (!fn) return null;
-    const t = await fn().catch(() => null);
-    return (typeof t === "string" && t.trim()) ? t.trim() : null;
-  } catch { return null; }
-}
+function nowISO() { return new Date().toISOString(); }
+function isWid(id: string) { return /^MLB\d{10,}$/i.test(id || ""); }
 
-function addAccessToken(url, token) {
-  if (!token) return url;
-  return url + (url.includes("?") ? "&" : "?") + "access_token=" + encodeURIComponent(token);
-}
-
-// ---------- HTTP helpers ----------
-const PUBLIC_HEADERS = {
-  Accept: "application/json",
-  "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
-  "Cache-Control": "no-cache",
-  // Alguns endpoints “públicos” do ML validam origem/referrer
-  Origin: "https://www.mercadolivre.com.br",
-  Referer: "https://www.mercadolivre.com.br/"
-};
-function authHeaders(token) {
-  const h = {
-    Accept: "application/json",
-    "User-Agent": "WidOnly/1.0 (server)",
-    "Cache-Control": "no-cache",
-    Authorization: `Bearer ${token}`
-  };
-  if (process.env.ML_INTEGRATOR_ID) h["x-integrator-id"] = String(process.env.ML_INTEGRATOR_ID);
-  return h;
-}
-
-async function fetchJson(url, headers) {
-  const r = await fetch(url, { headers, redirect: "follow" });
-  const ct = r.headers.get("content-type") || "";
-  const reqId = r.headers.get("x-request-id")
-    || r.headers.get("x-request-id-meli")
-    || r.headers.get("x-request-id-ml")
-    || null;
-  let data = null;
-  if (ct.includes("application/json")) {
-    try { data = await r.json(); } catch {}
-  } else {
-    try {
-      const txt = await r.text();
-      data = { _text: txt.slice(0, 2000) };
-    } catch {}
-  }
-  return { ok: r.ok, status: r.status, data, url, ct, reqId };
-}
-
-// /items?ids=...
-function normalizeBulk(r) {
-  const arr = Array.isArray(r.data) ? r.data : [];
-  const first = arr[0] || {};
-  if (first.code === 200 && first.body) {
-    return { ok: true, data: first.body, status: 200, url: r.url, ct: r.ct, reqId: r.reqId, raw: first };
-  }
-  return { ok: false, status: first.code || r.status || 404, url: r.url, ct: r.ct, reqId: r.reqId, raw: first };
-}
-
-// ---------- Extractors ----------
-function numOrZero(v) {
-  if (typeof v === "number") return v;
-  if (v && typeof v === "object" && typeof v.amount === "number") return v.amount;
-  return 0;
-}
-function extractFromPricesObject(pricesObj) {
-  const list = Array.isArray(pricesObj?.prices) ? pricesObj.prices : [];
-  if (!list.length) return null;
-  const candidates = list
-    .filter(p => numOrZero(p?.amount) > 0 && (!p.currency_id || p.currency_id === "BRL"))
-    .filter(p => !p.status || p.status === "active" || p.status === "available")
-    .sort((a,b) => new Date(b.last_updated || 0) - new Date(a.last_updated || 0));
-  if (candidates.length) return numOrZero(candidates[0].amount);
-  return null;
-}
-function extractFromVariations(variations) {
-  if (!Array.isArray(variations) || !variations.length) return null;
-  const vals = [];
-  for (const v of variations) {
-    const pv = numOrZero(v?.price);
-    if (pv > 0) vals.push(pv);
-    const plist = Array.isArray(v?.prices) ? v.prices : [];
-    for (const pp of plist) {
-      const pa = numOrZero(pp?.amount);
-      if (pa > 0) vals.push(pa);
-    }
-  }
-  if (!vals.length) return null;
-  return Math.min(...vals);
-}
-function extractPriceSold(body) {
-  let price =
-    numOrZero(body?.price) ||
-    numOrZero(body?.base_price) ||
-    numOrZero(body?.original_price) ||
-    0;
-  let sold  = Number.isFinite(body?.sold_quantity) ? body.sold_quantity : null;
-  if (price > 0) return { price, sold };
-
-  const fromPrices = extractFromPricesObject(body?.prices);
-  if (Number(fromPrices) > 0) return { price: Number(fromPrices), sold };
-
-  const fromVars = extractFromVariations(body?.variations);
-  if (Number(fromVars) > 0) return { price: Number(fromVars), sold };
-
-  return { price: 0, sold };
-}
-
-// ---------- Search fallback ----------
-async function getPriceViaSearch(wid, mode, token, dbg) {
-  let url = `${ML_BASE}/sites/MLB/search?q=${encodeURIComponent(wid)}&limit=3`;
-  let headers = { ...PUBLIC_HEADERS, Referer: `https://www.mercadolivre.com.br/MLB${wid.replace(/^MLB/i, "")}` };
-  if (mode === "auth_header" && token) headers = authHeaders(token);
-  else if (mode === "auth_query" && token) url = addAccessToken(url, token);
-
-  const r = await fetchJson(url, headers);
-  dbg.search.push({ mode, url, status: r.status, ok: r.ok, reqId: r.reqId, ct: r.ct });
-
-  if (!r.ok) return { ok:false, status:r.status, url, ct:r.ct, reqId:r.reqId, where:"search" };
-
-  const results = Array.isArray(r.data?.results) ? r.data.results : [];
-  let hit = results.find(x => (x && String(x.id).toUpperCase() === wid))
-        || results.find(x => (x?.permalink || "").toUpperCase().includes(wid));
-  if (!hit) return { ok:false, status:404, url, ct:r.ct, reqId:r.reqId, where:"search_no_hit" };
-
-  const price = Number(hit.price || 0);
-  if (price > 0) return { ok:true, price, where:"search" };
-  return { ok:false, status:404, url, ct:r.ct, reqId:r.reqId, where:"search_no_price" };
-}
-
-// ---------- Scrape ----------
-const HTML_HEADERS = {
-  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-  "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
-  Referer: "https://www.mercadolivre.com.br/",
-  Origin: "https://www.mercadolivre.com.br"
-};
-function safeJsonParse(s) { try { return JSON.parse(s); } catch { return null; } }
-function parseBRL(str) {
-  const s = String(str).replace(/\./g, "").replace(",", ".");
+function parseBRL(b: string) {
+  // "1.234,56" -> 1234.56
+  const s = (b || "").trim().replace(/\./g, "").replace(",", ".");
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
 }
-function findPriceInObject(obj) {
-  let best = null;
-  function walk(node, path = []) {
-    if (!node || typeof node !== "object") return;
-    if (typeof node.amount === "number" && node.amount > 0) {
-      const p = path.join(".").toLowerCase();
-      if (p.includes("price") || p.includes("unitprice") || p.includes("unit_price") || p.includes("buybox")) {
-        best = best ? Math.max(best, node.amount) : node.amount;
-      } else if (best == null) {
-        best = node.amount;
-      }
+
+function safeJson<T = any>(s: string): T | null { try { return JSON.parse(s) as T; } catch { return null; } }
+
+function findPriceDeep(o: any): number | null {
+  let best: number | null = null;
+  const walk = (n: any) => {
+    if (!n || typeof n !== "object") return;
+    if (typeof n.price === "number" && n.price > 0) best = Math.max(best ?? 0, n.price);
+    if (typeof n.amount === "number" && n.amount > 0) best = Math.max(best ?? 0, n.amount);
+    for (const k of Object.keys(n)) {
+      const v = (n as any)[k];
+      if (v && typeof v === "object") walk(v);
     }
-    if (typeof node.price === "number" && node.price > 0) {
-      best = best ? Math.max(best, node.price) : node.price;
-    }
-    for (const k of Object.keys(node)) {
-      const v = node[k];
-      if (v && typeof v === "object") walk(v, path.concat(k));
-      if (Array.isArray(v)) v.forEach((itm, i) => walk(itm, path.concat(k, String(i))));
-    }
-  }
-  walk(obj, []);
+  };
+  walk(o);
   return best;
 }
-function parsePriceFromHtml(html) {
-  // JSON-LD
-  const ld = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
-  for (const m of ld) {
-    const data = safeJsonParse(m[1]); if (!data) continue;
-    const nodes = Array.isArray(data) ? data : [data];
-    for (const node of nodes) {
+
+function extractPriceFromHTML(html: string): number | null {
+  // 1) JSON-LD (offers.price)
+  const ldMatches = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const m of ldMatches) {
+    const data = safeJson<any>(m[1]); if (!data) continue;
+    const arr = Array.isArray(data) ? data : [data];
+    for (const node of arr) {
       const offers = node?.offers;
       if (!offers) continue;
       if (Array.isArray(offers)) {
-        for (const off of offers) {
-          const p = Number(off?.price || 0); if (p > 0) return p;
+        for (const o of offers) {
+          const p = Number(o?.price || 0); if (p > 0) return p;
         }
       } else if (typeof offers === "object") {
         const p = Number(offers?.price || 0); if (p > 0) return p;
       }
     }
   }
-  // PRELOADED_STATE
+  // 2) __PRELOADED_STATE__/__NEXT_DATA__
   const mPre = html.match(/window\.__PRELOADED_STATE__\s*=\s*({[\s\S]*?});/);
   if (mPre) {
-    const obj = safeJsonParse(mPre[1]); const f = obj ? findPriceInObject(obj) : null;
-    if (Number(f) > 0) return Number(f);
+    const obj = safeJson(mPre[1]); const p = obj ? findPriceDeep(obj) : null;
+    if (p && p > 0) return p;
   }
-  // __NEXT_DATA__
-  const mNext = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/i)
-             || html.match(/__NEXT_DATA__\s*=\s*({[\s\S]*?});/);
+  const mNext = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/i);
   if (mNext) {
-    const obj = safeJsonParse(mNext[1]); const f = obj ? findPriceInObject(obj) : null;
-    if (Number(f) > 0) return Number(f);
+    const obj = safeJson(mNext[1]); const p = obj ? findPriceDeep(obj) : null;
+    if (p && p > 0) return p;
   }
-  // Meta tags comuns
-  const mMetaPrice = html.match(/<meta[^>]+itemprop=["']price["'][^>]+content=["']([\d\.]+)["']/i);
-  if (mMetaPrice) {
-    const p = Number(mMetaPrice[1]); if (p > 0) return p;
+  // 3) Seletores comuns
+  const mTest = html.match(/data-testid=["']price-value["'][^>]*>\s*R\$\s*([\d\.\,]+)/i);
+  if (mTest) { const p = parseBRL(mTest[1]); if (p && p > 0) return p; }
+  const mFrac = html.match(/andes-money-amount__fraction[^>]*>([\d\.]+)/i);
+  if (mFrac) {
+    const inteiros = mFrac[1].replace(/\./g, "");
+    const cents = (html.match(/andes-money-amount__cents[^>]*>(\d{2})/i)?.[1]) || "00";
+    const p = Number(`${inteiros}.${cents}`); if (p > 0) return p;
   }
-  const mOgPrice = html.match(/<meta[^>]+property=["']og:price:amount["'][^>]+content=["']([\d\.]+)["']/i);
-  if (mOgPrice) {
-    const p = Number(mOgPrice[1]); if (p > 0) return p;
-  }
-  // Selectors estáticos
-  const mFraction = html.match(/andes-money-amount__fraction[^>]*>([\d\.]+)/i);
-  if (mFraction) {
-    let frac = mFraction[1].replace(/\./g, "");
-    let cents = (html.match(/andes-money-amount__cents[^>]*>(\d{2})/i)?.[1]) || "00";
-    const p = Number(`${frac}.${cents}`); if (p > 0) return p;
-  }
-  const mTestId = html.match(/data-testid=["']price-value["'][^>]*>\s*R\$\s*([\d\.\,]+)/i);
-  if (mTestId) {
-    const p = parseBRL(mTestId[1]); if (p && p > 0) return p;
-  }
-  // BRL genérico
+  // 4) Fallback por regex BRL
   const money = [...html.matchAll(/R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*,\d{2})/g)]
     .map(m => parseBRL(m[1]))
-    .filter(n => typeof n === "number" && n > 0 && n < 1000000);
-  if (money.length) {
-    const max = Math.max(...money); if (max > 0) return max;
-  }
+    .filter(n => typeof n === "number" && n! > 0 && n! < 1_000_000) as number[];
+  if (money.length) return Math.max(...money);
   return null;
 }
-async function fetchHtml(url, dbg) {
-  try {
-    const r = await fetch(url, { headers: HTML_HEADERS, redirect: "follow" });
-    const status = r.status; const ok = r.ok;
-    let price = null;
-    if (ok) {
-      const html = await r.text();
-      price = parsePriceFromHtml(html);
-    }
-    dbg.scrape.push({ url, status, ok, price });
-    if (ok && price && price > 0) return { ok:true, price };
-  } catch (e) {
-    dbg.scrape.push({ url, error: String(e?.message || e) });
+
+async function browserlessContent(url: string) {
+  const base = process.env.BROWSERLESS_BASE_URL || "";
+  const token = process.env.BROWSERLESS_TOKEN || "";
+  if (!base || !token) {
+    return { ok: false, status: 500, html: "", error: "SCRAPE_MISCONFIG" };
   }
-  return { ok:false };
-}
-async function scrapePrice(wid, permalink, dbg) {
-  const urls = [];
-  if (permalink) urls.push(permalink);
-  urls.push(
-    `https://produto.mercadolivre.com.br/MLB${wid.replace(/^MLB/i, "")}`,
-    `https://www.mercadolivre.com.br/MLB${wid.replace(/^MLB/i, "")}`
-  );
-  for (const u of urls) {
-    const r = await fetchHtml(u, dbg);
-    if (r.ok) return r;
-  }
-  return { ok:false };
+  const endpoint = `${base.replace(/\/+$/, "")}/content?token=${encodeURIComponent(token)}`;
+  const r = await fetch(endpoint, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({
+      url,
+      gotoOptions: { waitUntil: "networkidle2", timeout: 20000 },
+      headers: {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
+        "Referer": "https://www.mercadolivre.com.br/",
+        "Origin": "https://www.mercadolivre.com.br"
+      }
+    })
+  });
+  const html = await r.text().catch(() => "");
+  return { ok: r.ok, status: r.status, html };
 }
 
-// ---------- Core ----------
-function summarizeKeys(obj, depth = 2) {
-  if (!obj || typeof obj !== "object" || depth < 0) return typeof obj;
-  const out = {};
-  for (const k of Object.keys(obj)) {
-    const v = obj[k];
-    if (v && typeof v === "object") {
-      out[k] = Array.isArray(v) ? `[array:${v.length}]` : summarizeKeys(v, depth - 1);
-    } else {
-      out[k] = typeof v;
-    }
-  }
-  return out;
-}
-function sampleJson(json, maxChars = 6000) {
-  try {
-    const s = JSON.stringify(json);
-    if (s.length <= maxChars) return json;
-    // corta mantendo início e fim
-    return {
-      _sample_begin: s.slice(0, Math.floor(maxChars * 0.6)),
-      _sample_end: s.slice(-Math.floor(maxChars * 0.35)),
-      _truncated: true
-    };
-  } catch {
-    return { _error: "cannot stringify" };
-  }
-}
-
-async function getPriceByWID(wid, token, dbg, wantBulkBody) {
-  const ATTRS_FULL = [
-    "price","base_price","original_price",
-    "prices","variations",
-    "status","available_quantity","sold_quantity",
-    "permalink","listing_type_id","catalog_product_id","title"
-  ].join(",");
-
-  const triesHeader = token ? [
-    { kind:"auth_direct_attrs", url:`${ML_BASE}/items/${wid}?attributes=${ATTRS_FULL}`, headers:authHeaders(token) },
-    { kind:"auth_bulk_attrs",   url:`${ML_BASE}/items?ids=${wid}&attributes=${ATTRS_FULL}`, headers:authHeaders(token), bulk:true },
-    { kind:"auth_direct",       url:`${ML_BASE}/items/${wid}`, headers:authHeaders(token) },
-    { kind:"auth_bulk",         url:`${ML_BASE}/items?ids=${wid}`, headers:authHeaders(token), bulk:true }
-  ] : [];
-  const triesQuery = token ? [
-    { kind:"authq_direct_attrs", url:addAccessToken(`${ML_BASE}/items/${wid}?attributes=${ATTRS_FULL}`, token), headers:PUBLIC_HEADERS },
-    { kind:"authq_bulk_attrs",   url:addAccessToken(`${ML_BASE}/items?ids=${wid}&attributes=${ATTRS_FULL}`, token), headers:PUBLIC_HEADERS, bulk:true },
-    { kind:"authq_direct",       url:addAccessToken(`${ML_BASE}/items/${wid}`, token), headers:PUBLIC_HEADERS },
-    { kind:"authq_bulk",         url:addAccessToken(`${ML_BASE}/items?ids=${wid}`, token), headers:PUBLIC_HEADERS, bulk:true }
-  ] : [];
-  const triesPublic = [
-    { kind:"public_direct_attrs", url:`${ML_BASE}/items/${wid}?attributes=${ATTRS_FULL}`, headers:PUBLIC_HEADERS },
-    { kind:"public_bulk_attrs",   url:`${ML_BASE}/items?ids=${wid}&attributes=${ATTRS_FULL}`, headers:PUBLIC_HEADERS, bulk:true },
-    { kind:"public_direct",       url:`${ML_BASE}/items/${wid}`, headers:PUBLIC_HEADERS },
-    { kind:"public_bulk",         url:`${ML_BASE}/items?ids=${wid}`, headers:PUBLIC_HEADERS, bulk:true }
+async function tryScrapePrice(wid: string): Promise<MLResp> {
+  const urls = [
+    `https://produto.mercadolivre.com.br/${wid}`,
+    `https://www.mercadolivre.com.br/${wid}`
   ];
-
-  let lastPermalink = null;
-
-  for (const seq of [triesHeader, triesQuery, triesPublic]) {
-    for (const t of seq) {
-      const r = await fetchJson(t.url, t.headers);
-      dbg.items.push({ kind:t.kind, url:t.url, status:r.status, ok:r.ok, reqId:r.reqId, ct:r.ct });
-      if (!r.ok) continue;
-
-      if (t.bulk) {
-        const nb = normalizeBulk(r);
-        if (!nb.ok) continue;
-
-        // sempre coletar um probe do bulk quando 200
-        if (!dbg.bulkProbe) {
-          const pricesArr = Array.isArray(nb.data?.prices?.prices) ? nb.data.prices.prices : [];
-          const varsArr   = Array.isArray(nb.data?.variations) ? nb.data.variations : [];
-          dbg.bulkProbe = {
-            from: t.kind,
-            topKeys: Object.keys(nb.data || {}),
-            hasPrice: !!nb.data?.price,
-            hasBasePrice: !!nb.data?.base_price,
-            hasOriginalPrice: !!nb.data?.original_price,
-            hasPricesBlock: pricesArr.length > 0,
-            variationsLen: varsArr.length,
-            pricesLen: pricesArr.length,
-            permalink: nb.data?.permalink || null,
-            keySummary: summarizeKeys(nb.data, 2),
-            prices_sample: pricesArr.slice(0, 2).map(p => ({
-              amount: (typeof p?.amount === "number" ? p.amount : (typeof p?.amount?.amount === "number" ? p.amount.amount : null)),
-              currency_id: p?.currency_id ?? null,
-              status: p?.status ?? null,
-              type: p?.type ?? null,
-              last_updated: p?.last_updated ?? null
-            })),
-            variations_sample: varsArr.slice(0, 2).map(v => ({
-              id: v?.id ?? null,
-              price: (typeof v?.price === "number" ? v.price : (typeof v?.price?.amount === "number" ? v.price.amount : null)),
-              hasPricesArray: Array.isArray(v?.prices) && v.prices.length > 0,
-              firstPrice: (Array.isArray(v?.prices) && v.prices[0]
-                ? (typeof v.prices[0].amount === "number" ? v.prices[0].amount
-                   : (typeof v.prices[0].amount?.amount === "number" ? v.prices[0].amount.amount : null))
-                : null)
-            }))
-          };
-          if (wantBulkBody) {
-            dbg.bulkBodySample = sampleJson(nb.data);
-          }
-        }
-
-        lastPermalink = nb.data?.permalink || lastPermalink;
-
-        const { price, sold } = extractPriceSold(nb.data);
-        if (price > 0) {
-          return { ok:true, price, item_id: wid, sold_winner: sold, via: t.kind };
-        }
-        continue;
-      }
-
-      // direto
-      lastPermalink = r.data?.permalink || lastPermalink;
-
-      const { price, sold } = extractPriceSold(r.data);
-      if (price > 0) {
-        return { ok:true, price, item_id: wid, sold_winner: sold, via: t.kind };
-      }
+  for (const u of urls) {
+    const r = await browserlessContent(u);
+    if (!r.ok || !r.html) continue;
+    const price = extractPriceFromHTML(r.html);
+    if (price && price > 0) {
+      return {
+        ok: true,
+        price,
+        source: "scrape",
+        product_id: wid,
+        item_id: wid,
+        fetched_at: nowISO()
+      };
     }
   }
-
-  // Busca (última chance antes do scrape)
-  const searchModes = token ? ["auth_header", "auth_query", "public"] : ["public"];
-  for (const m of searchModes) {
-    const sr = await getPriceViaSearch(wid, m, token, dbg);
-    if (sr.ok) return { ok:true, price: sr.price, item_id: wid, sold_winner: null, via: sr.where };
-  }
-
-  // Scrape (com permalink quando disponível)
-  if (dbg.enableScrape) {
-    const scr = await scrapePrice(wid, lastPermalink, dbg);
-    if (scr.ok) return { ok:true, price: scr.price, item_id: wid, sold_winner: null, via: "scrape" };
-  }
-
   return {
     ok: false,
-    status: 401,
     error_code: "UPSTREAM_ERROR",
-    message: "Falha ao obter preço do WID (itens, busca e scrape).",
-    details: { phase: "all-fallbacks-exhausted" }
+    message: "Falha ao obter preço do WID (API bloqueada e scraping sem preço).",
+    http_status: 401,
+    details: { phase: "scrape-failed" }
   };
 }
 
-// ---------- Handler ----------
-export default async function handler(req, res) {
+async function fetchML(url: string, token?: string) {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const r = await fetch(url, { headers });
+  const ct = r.headers.get("content-type") || "";
+  const isJson = ct.includes("application/json");
+  const text = await r.text().catch(() => "");
+  const body = isJson ? safeJson(text) : null;
+  return { ok: r.ok, status: r.status, body, ct, text };
+}
+
+async function tryMLItemPrice(wid: string): Promise<MLResp> {
+  const token = process.env.ML_ACCESS_TOKEN || ""; // se não tiver, tenta público
+  const attrs = "price,base_price,original_price,prices,status,available_quantity,sold_quantity,permalink";
+
+  // 1) Bulk com Authorization (costuma funcionar melhor que /items/{id}):
+  if (token) {
+    const u1 = `https://api.mercadolibre.com/items?ids=${wid}&attributes=${attrs}`;
+    const r1 = await fetchML(u1, token);
+    if (r1.ok && Array.isArray(r1.body)) {
+      const entry = r1.body[0];
+      const it = entry?.body;
+      const p = Number(it?.price || it?.base_price || 0);
+      if (p > 0) {
+        return { ok: true, price: p, source: "item", product_id: wid, item_id: wid, fetched_at: nowISO(), sold_winner: it?.sold_quantity ?? null };
+      }
+      // tenta prices[0].amount (alguns anúncios não expõem price simples)
+      const priceDeep = findPriceDeep(it?.prices);
+      if (priceDeep && priceDeep > 0) {
+        return { ok: true, price: priceDeep, source: "item", product_id: wid, item_id: wid, fetched_at: nowISO(), sold_winner: it?.sold_quantity ?? null };
+      }
+      // se veio 200 mas sem preço => provavelmente terceiro; deixa cair para scraping
+    } else if (r1.status === 401 || r1.status === 403) {
+      // bloqueado -> cair para scrape
+    }
+  }
+
+  // 2) Bulk público (costuma dar 401/HTML para terceiros)
+  const u2 = `https://api.mercadolibre.com/items?ids=${wid}&attributes=${attrs}`;
+  const r2 = await fetchML(u2);
+  if (r2.ok && Array.isArray(r2.body)) {
+    const entry = r2.body[0];
+    const it = entry?.body;
+    const p = Number(it?.price || it?.base_price || 0);
+    if (p > 0) {
+      return { ok: true, price: p, source: "item", product_id: wid, item_id: wid, fetched_at: nowISO(), sold_winner: it?.sold_quantity ?? null };
+    }
+    const priceDeep = findPriceDeep(it?.prices);
+    if (priceDeep && priceDeep > 0) {
+      return { ok: true, price: priceDeep, source: "item", product_id: wid, item_id: wid, fetched_at: nowISO(), sold_winner: it?.sold_quantity ?? null };
+    }
+  }
+  // se chegou aqui: API não deu preço (terceiro). Fallback:
+  return await tryScrapePrice(wid);
+}
+
+export default async function handler(req: any, res: any) {
   try {
+    // Cabeçalhos padrão
     res.setHeader("Content-Type", "application/json");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    res.setHeader("Cache-Control", "no-store");
+    if (req.method === "OPTIONS") return send(res, 200, { ok: true });
 
-    if (req.method === "OPTIONS") return sendJSON(res, 200, { ok: true });
-    if (req.method !== "GET")     return sendJSON(res, 200, { ok:false, error_code:"METHOD_NOT_ALLOWED", http_status:405 });
-
-    const q   = req.query || {};
-    const wid = String(q.wid || q.product_id || "").trim().toUpperCase();
-    const debug = String(q.debug || "") === "1";
-    const forceScrape = String(q.sf || q.scrape || "") === "1";
-    const enableScrape = forceScrape || String(process.env.ENABLE_SCRAPE_FALLBACK || "") === "1";
-    const wantBulkBody = String(q.bulk_body || "") === "1";
-
-    if (!isWID(wid)) {
-      return sendJSON(res, 200, { ok:false, error_code:"MISSING_WID", message:"Envie wid=MLBxxxxxxxxxx (10+ dígitos).", http_status:400 });
+    if (req.method !== "GET") {
+      return send(res, 200, {
+        ok: false,
+        error_code: "METHOD_NOT_ALLOWED",
+        message: "Use GET",
+        http_status: 405
+      });
     }
 
-    const token = await getTokenMaybe();
-    const dbg = {
-      vercelRegion: process.env.VERCEL_REGION || null,
-      tokenPresent: !!token,
-      enableScrape,
-      items: [],
-      search: [],
-      scrape: [],
-      bulkProbe: null
-    };
+    const raw = (req.query?.product_id || "").toString().trim();
+    const wid = raw.toUpperCase();
 
-    const out = await getPriceByWID(wid, token, dbg, wantBulkBody);
-
-    if (!out.ok) {
-      const err = { ok:false, error_code: out.error_code || "UPSTREAM_ERROR", message: out.message || "Falha ao consultar WID", http_status: out.status || 500, details: out.details || {} };
-      if (debug) err._debug = dbg;
-      return sendJSON(res, 200, err);
+    if (!isWid(wid)) {
+      return send(res, 200, {
+        ok: false,
+        error_code: "INVALID_ID_FORMAT",
+        message: "Use somente WID de item: MLB + 10+ dígitos (ex.: MLB3520318133).",
+        http_status: 400
+      });
     }
 
-    const resp = { ok:true, price: out.price, source:"item", product_id: wid, item_id: out.item_id, sold_winner: out.sold_winner, fetched_at: nowISO() };
-    if (debug) resp._debug = dbg;
-    return sendJSON(res, 200, resp);
+    const result = await tryMLItemPrice(wid);
+    return send(res, 200, result);
 
-  } catch (e) {
-    return sendJSON(res, 200, { ok:false, error_code:"INTERNAL", message:String(e?.message || e), http_status:500 });
+  } catch (e: any) {
+    return send(res, 200, {
+      ok: false,
+      error_code: "INTERNAL_ERROR",
+      message: e?.message || "Erro interno",
+      http_status: 500
+    });
   }
 }
